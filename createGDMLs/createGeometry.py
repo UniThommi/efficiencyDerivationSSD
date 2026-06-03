@@ -178,13 +178,13 @@ def _sphere_pmt_placement(voxel: dict) -> tuple[list, list]:
     # PMT should face inward: cathode top (local +z) points toward sphere center
     target_direction = np.array([-nx, -ny, -nz])
 
-    # Shift PMT outward so window bottom clears the Tyvek wall (approximate)
-    cutoff_r = np.sqrt(PMT_EFF_RADIUS**2 - PMT_Z_BOTTOM_CUT**2)
-    radial_shift = SPHERE_INNER_RADIUS - np.sqrt(SPHERE_INNER_RADIUS**2 - cutoff_r**2)
-    offset = PMT_Z_BOTTOM_CUT - radial_shift
-    x = cx + nx * offset
-    y = cy + ny * offset
-    z = cz + nz * offset
+    # Sagitta: curvature gap between sphere surface and flat PMT rim
+    # s = R - sqrt(R^2 - r_pmt^2)
+    sagitta = SPHERE_INNER_RADIUS - np.sqrt(SPHERE_INNER_RADIUS**2 - PMT_EFF_RADIUS**2)
+    shift = SPHERE_THICKNESS / 2 + sagitta - PMT_Z_BOTTOM_CUT
+    x = cx + nx * shift
+    y = cy + ny * shift
+    z = cz + nz * shift
 
     return get_euler_angles(target_direction), [x, y, z]
 
