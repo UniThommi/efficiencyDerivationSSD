@@ -133,7 +133,7 @@ def get_euler_angles(target_direction: np.ndarray) -> list:
     if abs(angle - np.pi) < 1e-6:
         return [float(np.pi), 0.0, 0.0]  # 180° around x-axis
 
-    axis = np.cross(default, target)  # correct: cross(from, to)
+    axis = np.cross(target, default)  # correct: cross(from, to)
     axis /= np.linalg.norm(axis)
 
     with warnings.catch_warnings():
