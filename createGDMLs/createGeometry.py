@@ -430,6 +430,12 @@ def _build_world(
     return world_lv
 
 
+def _macro_filename(gdml_path: str) -> str:
+    p = Path(gdml_path)
+    stem = p.stem
+    return str(p.parent / ("macro" + stem[0].upper() + stem[1:] + ".mac"))
+
+
 def _write_gdml(reg: geant4.Registry, out_filename: str) -> None:
     detectors.write_detector_auxvals(reg)
     visualization.write_color_auxvals(reg)
@@ -438,6 +444,9 @@ def _write_gdml(reg: geant4.Registry, out_filename: str) -> None:
     writer.addDetector(reg)
     writer.write(out_filename)
     print(f"  GDML written: {out_filename}")
+    macro_file = _macro_filename(out_filename)
+    detectors.generate_detector_macro(reg, macro_file)
+    print(f"  Macro written: {macro_file}")
 
 
 # ══════════════════════════ Sphere Geometry ═══════════════════════════════════
