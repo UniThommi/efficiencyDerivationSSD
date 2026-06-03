@@ -4,11 +4,17 @@ Unified GDML geometry creation for SSD efficiency validation.
 
 Geometries: wall | sphere | sphere_in_sphere
 Variants:
+  calc_reflectivity - Print area-weighted SSD reflectivity table to stdout (no GDML written).
+                      Run this BEFORE creating the SSD geometry to obtain the correct
+                      my_tyvek reflectivity values; then update legendoptics/my_tyvek manually.
   ssd           - SSD surface (area-weighted reflectivity); generates voxel JSON
   pmt           - Tyvek + PMTs; reads voxel JSON, selects N homogeneous PMTs
   pmt_no_tyvek  - PMTs only, no Tyvek wall (wall geometry only)
 
 Usage examples:
+  # 0. Calculate SSD reflectivity table for a sphere with 50 PMTs (update legendoptics first!)
+  python createGeometry.py --geometry sphere --variant calc_reflectivity --n-pmts 50
+
   # 1. Generate SSD sphere + voxel grid
   python createGeometry.py --geometry sphere --variant ssd --out sphere_ssd.gdml --voxels sphere_voxels.json
 
@@ -63,6 +69,18 @@ WALL_Z: float = 1.0                   # mm — wall thickness
 PMT_DETECTOR_ID_BASE: int = 10000     # rawid = PMT_DETECTOR_ID_BASE + i
 TYVEK_DETECTOR_ID: int = 1000         # rawid for Tyvek / SSD surface
 INNER_SPHERE_DETECTOR_ID: int = 9000  # rawid for inner steel sphere
+
+PMT_CATHODE_REFLECTIVITY: float = 0.028725181851905604  # wavelength-independent
+
+TYVEK_REFLECTIVITY_TABLE: list[tuple[float, float]] = [
+    (250, 0.80),
+    (300, 0.90),
+    (355, 0.945),
+    (400, 0.96),
+    (440, 0.96),
+    (500, 0.96),
+    (800, 0.96),
+]
 
 
 # ══════════════════════════════ PMT Geometry ═══════════════════════════════════
@@ -415,6 +433,38 @@ def plot_voxels_3d(
     print(f"  Saved: {filename}")
 
 
+# ══════════════════════════ Reflectivity Calculation ═════════════════════════
+
+def calc_ssd_reflectivity(geometry: str, n_pmts: int) -> None:
+    """
+    Print the area-weighted SSD reflectivity table to stdout.
+
+    R_SSD(λ) = S * R_cathode + (1 - S) * R_Tyvek(λ)
+    where S = A_PMT / A_total  (inner sphere excluded from A_total).
+    """
+    if geometry in ("sphere", "sphere_in_sphere"):
+        a_total = 4.0 * np.pi * SPHERE_INNER_RADIUS**2
+    elif geometry == "wall":
+        a_total = WALL_X * WALL_Y
+    else:
+        raise ValueError(f"Unknown geometry: {geometry!r}")
+
+    a_pmt = n_pmts * np.pi * PMT_CATHODE_RADIUS**2
+    s = a_pmt / a_total
+
+    print(f"# geometry:   {geometry}")
+    print(f"# n_pmts:     {n_pmts}")
+    print(f"# A_PMT:      {a_pmt:.4f} mm²")
+    print(f"# A_total:    {a_total:.4f} mm²")
+    print(f"# S = A_PMT / A_total = {s:.10f}")
+    print(f"# R_cathode:  {PMT_CATHODE_REFLECTIVITY}")
+    print(f"# R_SSD(λ) = S * R_cathode + (1-S) * R_Tyvek(λ)")
+    print("# nm   dimensionless")
+    for nm, r_tyvek in TYVEK_REFLECTIVITY_TABLE:
+        r_ssd = s * PMT_CATHODE_REFLECTIVITY + (1.0 - s) * r_tyvek
+        print(f"{nm}    {r_ssd:.15f}")
+
+
 # ═══════════════════════════ World Builder ════════════════════════════════════
 
 def _build_world(
@@ -731,8 +781,9 @@ def main() -> None:
         help="Detector geometry type",
     )
     parser.add_argument(
-        "--variant", choices=["ssd", "pmt", "pmt_no_tyvek"], required=True,
+        "--variant", choices=["calc_reflectivity", "ssd", "pmt", "pmt_no_tyvek"], required=True,
         help=(
+            "calc_reflectivity: print area-weighted SSD reflectivity table (no GDML written); "
             "ssd: SSD surface + voxel generation; "
             "pmt: Tyvek + PMTs (reads voxels file); "
             "pmt_no_tyvek: PMTs only, no Tyvek wall (wall geometry only)"
@@ -743,14 +794,15 @@ def main() -> None:
         help="Number of PMTs to place (pmt/pmt_no_tyvek variants only, default: 50)",
     )
     parser.add_argument(
-        "--out", type=str, required=True,
-        help="Output GDML filename",
+        "--out", type=str, default=None,
+        help="Output GDML filename (required for all variants except calc_reflectivity)",
     )
     parser.add_argument(
-        "--voxels", type=str, required=True,
+        "--voxels", type=str, default=None,
         help=(
             "ssd variant: output path for voxel JSON; "
-            "pmt* variants: input path to existing voxel JSON"
+            "pmt* variants: input path to existing voxel JSON; "
+            "not used for calc_reflectivity"
         ),
     )
     parser.add_argument(
@@ -763,7 +815,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Validate combinations
+    # ── calc_reflectivity: print table and exit ──────────────────────────────
+    if args.variant == "calc_reflectivity":
+        calc_ssd_reflectivity(args.geometry, args.n_pmts)
+        return
+
+    # Validate combinations for GDML-generating variants
+    if args.out is None:
+        parser.error("--out is required for this variant")
+    if args.voxels is None:
+        parser.error("--voxels is required for this variant")
+
     if args.variant == "pmt_no_tyvek" and args.geometry != "wall":
         parser.error("--variant pmt_no_tyvek is only valid for --geometry wall")
 
