@@ -942,32 +942,34 @@ def main() -> None:
 
     n_pmts = len(selected_voxels)
 
-    # ── Load HDF5 data ───────────────────────────────────────────────────────
-    print("\n── Loading HDF5 data ─────────────────────────────────────────────────")
+    # ── Load HDF5 data + validity filter (interleaved to cap peak memory) ───
+    # Vertex arrays (~3.2 GB per scenario) are freed immediately after filtering.
+    _VERTEX_KEYS = ["v_evtid", "vx", "vy", "vz"]
+
+    print("\n── Loading HDF5 data and applying validity filters ───────────────────")
     print("  SSD scenario:")
     ssd_data = load_hdf5_dir(args.data_ssd)
+    ssd_valid, ssd_stats = apply_validity_filter(ssd_data, args.geometry)
+    for k in _VERTEX_KEYS:
+        del ssd_data[k]
+
     print("  PMT+Tyvek scenario:")
     pmt_data = load_hdf5_dir(args.data_pmt)
+    pmt_valid, pmt_stats = apply_validity_filter(pmt_data, args.geometry)
+    for k in _VERTEX_KEYS:
+        del pmt_data[k]
 
     pmt_notyvek_data: Optional[dict] = None
+    pmt_notyvek_valid: Optional[np.ndarray] = None
+    pmt_notyvek_stats: Optional[dict] = None
     if args.data_pmt_no_tyvek is not None and args.data_pmt_no_tyvek.exists():
         print("  PMT-only scenario:")
         pmt_notyvek_data = load_hdf5_dir(args.data_pmt_no_tyvek)
-
-    # ── 2.1 Validity filter ─────────────────────────────────────────────────
-    print("\n── Applying validity filters ─────────────────────────────────────────")
-    print("  SSD:")
-    ssd_valid, ssd_stats = apply_validity_filter(ssd_data, args.geometry)
-    print("  PMT+Tyvek:")
-    pmt_valid, pmt_stats = apply_validity_filter(pmt_data, args.geometry)
-
-    pmt_notyvek_valid: Optional[np.ndarray] = None
-    pmt_notyvek_stats: Optional[dict] = None
-    if pmt_notyvek_data is not None:
-        print("  PMT-only:")
         pmt_notyvek_valid, pmt_notyvek_stats = apply_validity_filter(
             pmt_notyvek_data, args.geometry
         )
+        for k in _VERTEX_KEYS:
+            del pmt_notyvek_data[k]
 
     plot_validity_report(
         ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
