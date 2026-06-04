@@ -602,9 +602,9 @@ def build_sphere_geometry(
         # ── Place PMTs ─────────────────────────────────────────────────────
         print(f"\n=== Placing {actual_n} PMTs ===")
         pmt_volumes = construct_pmt_front(mat_registry.vacuum, surface_registry, reg)
-        for i, voxel in enumerate(sel_voxels):
+        for voxel in sel_voxels:
             rotation, translation = _sphere_pmt_placement(voxel)
-            rawid = PMT_DETECTOR_ID_BASE + i
+            rawid = PMT_DETECTOR_ID_BASE + int(voxel["index"])
             place_pmt_front(
                 rotation, translation, pmt_volumes,
                 f"PMT{voxel['index']}", world_lv, reg,
@@ -693,9 +693,9 @@ def build_wall_geometry(
         # ── Place PMTs ─────────────────────────────────────────────────────
         print(f"\n=== Placing {actual_n} PMTs ===")
         pmt_volumes = construct_pmt_front(mat_registry.vacuum, surface_registry, reg)
-        for i, voxel in enumerate(sel_voxels):
+        for voxel in sel_voxels:
             rotation, translation = _wall_pmt_placement(voxel)
-            rawid = PMT_DETECTOR_ID_BASE + i  # sequential: 10000, 10001, ...
+            rawid = PMT_DETECTOR_ID_BASE + int(voxel["index"])
             place_pmt_front(
                 rotation, translation, pmt_volumes,
                 f"PMT{voxel['index']}", world_lv, reg,

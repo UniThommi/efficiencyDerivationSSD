@@ -766,8 +766,8 @@ def analyze_per_voxel_efficiency(
     # Match PMT rawid = PMT_DETECTOR_ID_BASE + i to selected_voxels[i]
     n_pmt_vox = len(selected_voxels)
     pmt_counts: np.ndarray = np.zeros(n_pmt_vox, dtype=int)
-    for i in range(n_pmt_vox):
-        expected_rawid = PMT_DETECTOR_ID_BASE + i
+    for i, sv in enumerate(selected_voxels):
+        expected_rawid = PMT_DETECTOR_ID_BASE + int(sv["index"])
         pmt_counts[i] = pmt_counts_by_rawid.get(expected_rawid, 0)
 
     # SSD counts at PMT voxel positions
