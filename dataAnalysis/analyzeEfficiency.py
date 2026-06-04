@@ -88,6 +88,7 @@ def _load_one_hdf5(path: Path) -> dict[str, np.ndarray]:
             "evtid":      np.asarray(opt["evtid"]["pages"]),
             "det_uid":    np.asarray(opt["det_uid"]["pages"]),
             "wavelength": np.asarray(opt["wavelength_in_nm"]["pages"]),
+            "time":       np.asarray(opt["time_in_ns"]["pages"]),
             # Emission vertices (positions in mm)
             "v_evtid": np.asarray(vert["evtid"]["pages"]),
             "vx":      np.asarray(vert["xloc_in_m"]["pages"]) * M_TO_MM,
@@ -210,6 +211,7 @@ def load_and_filter_hdf5_dir(
             "z":          fdata["z"][vmask],
             "det_uid":    fdata["det_uid"][vmask],
             "wavelength": fdata["wavelength"][vmask],
+            "time":       fdata["time"][vmask],
         })
         # fdata (vertices + full hit arrays) freed here
 
@@ -1044,6 +1046,84 @@ def plot_wavelength_histograms(
     print(f"  Saved: {out}")
 
 
+# ═══════════════════════════ Time Distributions ══════════════════════════════
+
+def plot_time_distributions(
+    ssd_data: dict,
+    pmt_data: dict,
+    geometry: str,
+    output_dir: Path,
+) -> None:
+    """Hit-time histograms for outer and (if sphere_in_sphere) inner sphere."""
+    print("\n── Time Distributions ────────────────────────────────────────────────")
+
+    def _hist_pair(
+        t_ssd: np.ndarray,
+        t_pmt: np.ndarray,
+        title_ssd: str,
+        title_pmt: str,
+        suptitle: str,
+        filename: Path,
+    ) -> None:
+        t_min = min(
+            t_ssd.min() if len(t_ssd) else 0.0,
+            t_pmt.min() if len(t_pmt) else 0.0,
+        )
+        t_max = max(
+            t_ssd.max() if len(t_ssd) else 1.0,
+            t_pmt.max() if len(t_pmt) else 1.0,
+        )
+        bins = np.linspace(t_min, t_max, 101)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+        ax1.hist(t_ssd, bins=bins, color="steelblue", alpha=0.8, density=True)
+        ax1.set_xlabel("Time (ns)")
+        ax1.set_ylabel("Density (normalised)")
+        ax1.set_title(f"{title_ssd}\n{len(t_ssd):,} hits")
+        ax1.grid(True, alpha=0.3)
+
+        ax2.hist(t_pmt, bins=bins, color="orange", alpha=0.8, density=True)
+        ax2.set_xlabel("Time (ns)")
+        ax2.set_ylabel("Density (normalised)")
+        ax2.set_title(f"{title_pmt}\n{len(t_pmt):,} hits")
+        ax2.grid(True, alpha=0.3)
+
+        fig.suptitle(suptitle, fontsize=13)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200)
+        plt.close(fig)
+        print(f"  Saved: {filename}")
+
+    # ── Outer sphere ──────────────────────────────────────────────────────────
+    # SSD simulation: hits on SSD/Tyvek surface (UID 1000)
+    ssd_outer_t = ssd_data["time"][ssd_data["det_uid"] == TYVEK_DETECTOR_ID]
+    # PMT+Tyvek simulation: PMT cathode hits (UID ≥ 10000); Tyvek wall is
+    # a pure reflector and records no hits in this setup.
+    pmt_outer_t = pmt_data["time"][pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE]
+
+    _hist_pair(
+        ssd_outer_t, pmt_outer_t,
+        title_ssd=f"SSD (UID {TYVEK_DETECTOR_ID})",
+        title_pmt=f"PMT+Tyvek — cathode (UID ≥ {PMT_DETECTOR_ID_BASE})",
+        suptitle=f"Outer sphere hit time distribution — {geometry}",
+        filename=output_dir / "time_distribution_outer.png",
+    )
+
+    # ── Inner sphere (sphere_in_sphere only) ──────────────────────────────────
+    if geometry == "sphere_in_sphere":
+        ssd_inner_t = ssd_data["time"][ssd_data["det_uid"] == INNER_SPHERE_DETECTOR_ID]
+        pmt_inner_t = pmt_data["time"][pmt_data["det_uid"] == INNER_SPHERE_DETECTOR_ID]
+
+        _hist_pair(
+            ssd_inner_t, pmt_inner_t,
+            title_ssd=f"SSD — inner sphere (UID {INNER_SPHERE_DETECTOR_ID})",
+            title_pmt=f"PMT+Tyvek — inner sphere (UID {INNER_SPHERE_DETECTOR_ID})",
+            suptitle=f"Inner sphere hit time distribution — {geometry}",
+            filename=output_dir / "time_distribution_inner.png",
+        )
+
+
 # ═══════════════════════════════════ Main ════════════════════════════════════
 
 def main() -> None:
@@ -1164,6 +1244,11 @@ def main() -> None:
     # ── Wavelength histograms ────────────────────────────────────────────────
     plot_wavelength_histograms(
         ssd_data, pmt_data, args.data_ssd, args.geometry, args.output_dir
+    )
+
+    # ── Time distributions ───────────────────────────────────────────────────
+    plot_time_distributions(
+        ssd_data, pmt_data, args.geometry, args.output_dir
     )
 
     # ── Save summary JSON ───────────────────────────────────────────────────
