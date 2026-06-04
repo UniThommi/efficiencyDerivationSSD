@@ -130,6 +130,77 @@ def load_hdf5_dir(directory: Path) -> dict[str, np.ndarray]:
     return combined
 
 
+def load_and_filter_hdf5_dir(
+    directory: Path,
+    geometry: str,
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict]:
+    """
+    Load and validity-filter HDF5 files one at a time to minimise peak RAM.
+
+    Each file's vertex arrays (~800 MB for 25 M vertices) are freed as soon as
+    the validity mask is computed.  Only the four columns needed downstream
+    (x, y, z, det_uid) are kept for valid hits.
+
+    Returns
+    -------
+    data       : dict with keys x, y, z, det_uid — valid hits only
+    valid_mask : all-True boolean array (hits are already filtered)
+    stats      : aggregated validity stats across all files
+    """
+    files = sorted(directory.glob("*.hdf5")) + sorted(directory.glob("*.h5"))
+    if not files:
+        raise FileNotFoundError(f"No HDF5 files found in {directory}")
+
+    print(f"  Loading {len(files)} HDF5 file(s) from {directory} …")
+
+    kept: list[dict] = []
+    stats: dict = {
+        "total": 0, "valid": 0, "invalid_vertex": 0,
+        "invalid_momentum": 0, "no_vertex_match": 0,
+        "outside_per_surface": {},
+    }
+
+    offset = np.int64(0)
+    for f in files:
+        fdata = _load_one_hdf5(f)
+        n_hits  = len(fdata["x"])
+        n_verts = len(fdata["v_evtid"])
+        print(f"    {f.name}: {n_hits} hits, {n_verts} vertices")
+
+        fdata["evtid"]   = fdata["evtid"].astype(np.int64)   + offset
+        fdata["v_evtid"] = fdata["v_evtid"].astype(np.int64) + offset
+        max_id = np.int64(fdata["v_evtid"].max()) + 1 if n_verts else np.int64(0)
+        offset += max_id
+
+        vmask, fstats = apply_validity_filter(fdata, geometry)
+
+        stats["total"]            += fstats["total"]
+        stats["valid"]            += fstats["valid"]
+        stats["invalid_vertex"]   += fstats["invalid_vertex"]
+        stats["invalid_momentum"] += fstats["invalid_momentum"]
+        stats["no_vertex_match"]  += fstats["no_vertex_match"]
+        for uid, cnt in fstats["outside_per_surface"].items():
+            stats["outside_per_surface"][uid] = (
+                stats["outside_per_surface"].get(uid, 0) + cnt
+            )
+
+        kept.append({
+            "x":       fdata["x"][vmask],
+            "y":       fdata["y"][vmask],
+            "z":       fdata["z"][vmask],
+            "det_uid": fdata["det_uid"][vmask],
+        })
+        # fdata (vertices + full hit arrays) freed here
+
+    n_valid = sum(len(p["x"]) for p in kept)
+    print(f"    Total: {stats['total']} optical hits, {n_valid} valid")
+
+    combined: dict[str, np.ndarray] = {
+        k: np.concatenate([p[k] for p in kept]) for k in kept[0]
+    }
+    return combined, np.ones(len(combined["x"]), dtype=bool), stats
+
+
 # ══════════════════════════════ Validity Filter ═══════════════════════════════
 
 def _vertex_position(hit_evtid: np.ndarray, data: dict) -> np.ndarray:
@@ -942,34 +1013,26 @@ def main() -> None:
 
     n_pmts = len(selected_voxels)
 
-    # ── Load HDF5 data + validity filter (interleaved to cap peak memory) ───
-    # Vertex arrays (~3.2 GB per scenario) are freed immediately after filtering.
-    _VERTEX_KEYS = ["v_evtid", "vx", "vy", "vz"]
-
+    # ── Load HDF5 data + validity filter (one file at a time to cap peak RAM) ─
     print("\n── Loading HDF5 data and applying validity filters ───────────────────")
     print("  SSD scenario:")
-    ssd_data = load_hdf5_dir(args.data_ssd)
-    ssd_valid, ssd_stats = apply_validity_filter(ssd_data, args.geometry)
-    for k in _VERTEX_KEYS:
-        del ssd_data[k]
+    ssd_data, ssd_valid, ssd_stats = load_and_filter_hdf5_dir(
+        args.data_ssd, args.geometry
+    )
 
     print("  PMT+Tyvek scenario:")
-    pmt_data = load_hdf5_dir(args.data_pmt)
-    pmt_valid, pmt_stats = apply_validity_filter(pmt_data, args.geometry)
-    for k in _VERTEX_KEYS:
-        del pmt_data[k]
+    pmt_data, pmt_valid, pmt_stats = load_and_filter_hdf5_dir(
+        args.data_pmt, args.geometry
+    )
 
     pmt_notyvek_data: Optional[dict] = None
     pmt_notyvek_valid: Optional[np.ndarray] = None
     pmt_notyvek_stats: Optional[dict] = None
     if args.data_pmt_no_tyvek is not None and args.data_pmt_no_tyvek.exists():
         print("  PMT-only scenario:")
-        pmt_notyvek_data = load_hdf5_dir(args.data_pmt_no_tyvek)
-        pmt_notyvek_valid, pmt_notyvek_stats = apply_validity_filter(
-            pmt_notyvek_data, args.geometry
+        pmt_notyvek_data, pmt_notyvek_valid, pmt_notyvek_stats = load_and_filter_hdf5_dir(
+            args.data_pmt_no_tyvek, args.geometry
         )
-        for k in _VERTEX_KEYS:
-            del pmt_notyvek_data[k]
 
     plot_validity_report(
         ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
