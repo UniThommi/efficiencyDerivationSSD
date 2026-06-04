@@ -316,13 +316,10 @@ def apply_validity_filter(
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
-        # Only flag outside-in photons on the Tyvek/SSD surface;
-        # PMT cathode hits can arrive from any angle (wide acceptance cone).
-        tyvek_mask = data["det_uid"] == TYVEK_DETECTOR_ID
         n_active = _outward_normal_sphere(hit_pos)
         dot = np.sum(momentum * n_active, axis=1)
-        momentum_invalid = valid & tyvek_mask & (dot > 0)
-        valid[momentum_invalid] = False
+        momentum_invalid = valid & (dot > 0)
+        # counted for diagnostics only — not removed from valid
 
     elif geometry == "sphere_in_sphere":
         r_vert = np.linalg.norm(vertex_pos, axis=1)
@@ -332,13 +329,11 @@ def apply_validity_filter(
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
-        # Only flag outside-in photons on the Tyvek/SSD surface;
-        # PMTs and the inner sphere are excluded from the directional check.
-        tyvek_mask = data["det_uid"] == TYVEK_DETECTOR_ID
-        n_active = _outward_normal_sphere(hit_pos)
+        inner_mask = data["det_uid"] == INNER_SPHERE_DETECTOR_ID
+        n_active = _outward_normal_sphere(hit_pos, inner_sphere_hits=inner_mask)
         dot = np.sum(momentum * n_active, axis=1)
-        momentum_invalid = valid & tyvek_mask & (dot > 0)
-        valid[momentum_invalid] = False
+        momentum_invalid = valid & (dot > 0)
+        # counted for diagnostics only — not removed from valid
 
     elif geometry == "wall":
         # Assumes photon source is on the +z side of the wall.
@@ -347,11 +342,9 @@ def apply_validity_filter(
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
-        # Momentum check only on primary surface — PMT hits can arrive from any direction.
-        primary_surface = data["det_uid"] == TYVEK_DETECTOR_ID
         dot = data["pz"]
-        momentum_invalid = valid & primary_surface & (dot > 0)
-        valid[momentum_invalid] = False
+        momentum_invalid = valid & (dot > 0)
+        # counted for diagnostics only — not removed from valid
 
     else:
         raise ValueError(f"Unknown geometry: {geometry!r}")
@@ -863,8 +856,8 @@ def plot_validity_report(
               f"invalid vertex={stats['invalid_vertex']},  "
               f"invalid momentum={stats['invalid_momentum']}")
         if stats["invalid_momentum"] > 0:
-            print(f"  *** WARNING: {label}: {stats['invalid_momentum']} photons "
-                  f"hit surface from outside! ***")
+            print(f"  Note: {label}: {stats['invalid_momentum']} photons hit surface "
+                  f"from outside (not filtered, see outside_in_hits.png)")
             per_surf = stats.get("outside_per_surface", {})
             for uid, cnt in sorted(per_surf.items()):
                 print(f"      det_uid={uid}: {cnt} outside-in hits")
@@ -895,34 +888,53 @@ def plot_validity_report(
     plt.close(fig)
     print(f"  Saved: {out}")
 
-    # Per-surface outside-in plot (only if any invalid momentum hits found)
-    any_outside = any(s[1]["invalid_momentum"] > 0 for s in all_stats)
-    if any_outside:
-        # Collect all det_uids that had outside-in hits across all scenarios
-        all_uids: set[int] = set()
-        for _, stats in all_stats:
-            all_uids.update(stats.get("outside_per_surface", {}).keys())
-        all_uids_sorted = sorted(all_uids)
 
-        fig, ax = plt.subplots(figsize=(max(8, len(all_uids_sorted) * 0.6), 5))
-        bar_w = 0.8 / max(len(all_stats), 1)
-        for j, (label, stats) in enumerate(all_stats):
-            per_surf = stats.get("outside_per_surface", {})
-            counts = [per_surf.get(uid, 0) for uid in all_uids_sorted]
-            x = np.arange(len(all_uids_sorted)) + (j - len(all_stats) / 2) * bar_w
-            ax.bar(x, counts, bar_w, label=label, alpha=0.8)
-        ax.set_xticks(np.arange(len(all_uids_sorted)))
-        ax.set_xticklabels([str(u) for u in all_uids_sorted], rotation=45)
-        ax.set_xlabel("det_uid")
-        ax.set_ylabel("Outside-in hits (INVALID)")
-        ax.set_title(f"Photons hitting surface from outside — {geometry}")
-        ax.legend()
-        ax.grid(axis="y", alpha=0.3)
-        plt.tight_layout()
-        out2 = output_dir / "validity_outside_in_hits.png"
-        plt.savefig(out2, dpi=200)
-        plt.close(fig)
-        print(f"  Saved: {out2}")
+# ═══════════════════════════ Outside-in Hits Plot ════════════════════════════
+
+def plot_outside_in_hits(
+    ssd_stats: dict,
+    pmt_stats: dict,
+    geometry: str,
+    output_dir: Path,
+    pmt_notyvek_stats: Optional[dict] = None,
+) -> None:
+    """Bar chart of outside-in photon counts per surface and scenario (not filtered)."""
+    print("\n── Outside-in Hits ───────────────────────────────────────────────────")
+
+    all_stats = [("SSD", ssd_stats), ("PMT+Tyvek", pmt_stats)]
+    if pmt_notyvek_stats is not None:
+        all_stats.append(("PMT only", pmt_notyvek_stats))
+
+    all_uids: set[int] = set()
+    for _, stats in all_stats:
+        all_uids.update(stats.get("outside_per_surface", {}).keys())
+
+    if not all_uids:
+        print("  No outside-in hits found in any scenario.")
+        return
+
+    all_uids_sorted = sorted(all_uids)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(all_uids_sorted) * 0.8), 5))
+    bar_w = 0.8 / max(len(all_stats), 1)
+    for j, (label, stats) in enumerate(all_stats):
+        per_surf = stats.get("outside_per_surface", {})
+        counts = [per_surf.get(uid, 0) for uid in all_uids_sorted]
+        x = np.arange(len(all_uids_sorted)) + (j - len(all_stats) / 2) * bar_w
+        ax.bar(x, counts, bar_w, label=label, alpha=0.8)
+
+    ax.set_xticks(np.arange(len(all_uids_sorted)))
+    ax.set_xticklabels([str(u) for u in all_uids_sorted], rotation=45)
+    ax.set_xlabel("det_uid")
+    ax.set_ylabel("Outside-in hits (not filtered)")
+    ax.set_title(f"Photons hitting surface from outside — {geometry}")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "outside_in_hits.png"
+    plt.savefig(out, dpi=200)
+    plt.close(fig)
+    print(f"  Saved: {out}")
 
 
 # ════════════════════════════ 3D Voxel Plot ══════════════════════════════════
@@ -1217,6 +1229,9 @@ def main() -> None:
         )
 
     plot_validity_report(
+        ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
+    )
+    plot_outside_in_hits(
         ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
     )
 
