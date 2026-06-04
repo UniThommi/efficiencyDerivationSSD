@@ -626,7 +626,7 @@ def analyze_total_hits(
         ax.bar(["SSD", "PMT+Tyvek"], [n_inner_ssd, n_inner_pmt],
                color=["steelblue", "orange"], alpha=0.8)
         ax.set_ylabel("Inner sphere hits")
-        ax.set_title("Inner sphere hits: SSD vs. PMT+Tyvek\n(should be identical)")
+        ax.set_title(f"Inner sphere hits (UID {INNER_SPHERE_DETECTOR_ID}): SSD vs. PMT+Tyvek\n(should be identical)")
         ax.text(0.5, 0.98, f"ratio = {ratio:.4f}",
                 ha="center", va="top", transform=ax.transAxes)
         ax.grid(axis="y", alpha=0.3)
@@ -638,7 +638,7 @@ def analyze_total_hits(
 
     # Optionally include pmt_no_tyvek
     datasets = {
-        "SSD": n_ssd,
+        f"SSD\n(UID {TYVEK_DETECTOR_ID})": n_ssd,
         "PMT+Tyvek\n(total)": n_pmt_all,
         "PMT cathode\nonly": n_pmt_cathode,
     }
@@ -803,8 +803,8 @@ def analyze_per_voxel_efficiency(
 
     ax = axes[0]
     bar_w = 0.4
-    ax.bar(x_pos - bar_w / 2, ssd_at_pmt, bar_w, label="SSD (at PMT voxel)", color="steelblue", alpha=0.8)
-    ax.bar(x_pos + bar_w / 2, pmt_counts,   bar_w, label="PMT+Tyvek",          color="orange",   alpha=0.8)
+    ax.bar(x_pos - bar_w / 2, ssd_at_pmt, bar_w, label=f"SSD, UID {TYVEK_DETECTOR_ID} (at PMT voxel)", color="steelblue", alpha=0.8)
+    ax.bar(x_pos + bar_w / 2, pmt_counts,   bar_w, label="PMT cathode",                               color="orange",   alpha=0.8)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax.set_ylabel("Hit count")
@@ -882,6 +882,11 @@ def plot_validity_report(
     ax.set_title(f"Photon validity filter — {geometry}")
     ax.legend()
     ax.grid(axis="y", alpha=0.3)
+    uid_note = f"SSD/Tyvek surface: UID {TYVEK_DETECTOR_ID}"
+    if geometry == "sphere_in_sphere":
+        uid_note += f"  |  inner sphere: UID {INNER_SPHERE_DETECTOR_ID}"
+    ax.text(0.02, 0.98, uid_note, transform=ax.transAxes,
+            va="top", fontsize=7, color="dimgray")
     plt.tight_layout()
     out = output_dir / "validity_filter.png"
     plt.savefig(out, dpi=200)
@@ -953,7 +958,7 @@ def plot_3d_voxels(
     if len(other):
         ax.scatter(other[:, 0], other[:, 1], other[:, 2],
                    c="cornflowerblue", s=20, alpha=0.55,
-                   label=f"All voxels ({(~sel_mask).sum()})")
+                   label=f"All voxels, UID {TYVEK_DETECTOR_ID} ({(~sel_mask).sum()})")
 
     sel = all_centers[sel_mask]
     if len(sel):
@@ -1021,7 +1026,7 @@ def plot_wavelength_histograms(
 
     # Right: detected spectra (SSD + PMT cathode overlaid)
     ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7, density=True,
-             label=f"SSD surface ({len(ssd_wl):,})")
+             label=f"SSD surface, UID {TYVEK_DETECTOR_ID} ({len(ssd_wl):,})")
     ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7, density=True,
              label=f"PMT cathode ({len(pmt_wl):,})")
     ax2.set_xlabel("Wavelength (nm)")
