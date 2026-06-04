@@ -79,14 +79,15 @@ def _load_one_hdf5(path: Path) -> dict[str, np.ndarray]:
 
         data = {
             # Optical hits (positions in mm, momenta dimensionless unit vector)
-            "x":       np.asarray(opt["x_position_in_m"]["pages"]) * M_TO_MM,
-            "y":       np.asarray(opt["y_position_in_m"]["pages"]) * M_TO_MM,
-            "z":       np.asarray(opt["z_position_in_m"]["pages"]) * M_TO_MM,
-            "px":      np.asarray(opt["x_momentum_direction"]["pages"]),
-            "py":      np.asarray(opt["y_momentum_direction"]["pages"]),
-            "pz":      np.asarray(opt["z_momentum_direction"]["pages"]),
-            "evtid":   np.asarray(opt["evtid"]["pages"]),
-            "det_uid": np.asarray(opt["det_uid"]["pages"]),
+            "x":          np.asarray(opt["x_position_in_m"]["pages"]) * M_TO_MM,
+            "y":          np.asarray(opt["y_position_in_m"]["pages"]) * M_TO_MM,
+            "z":          np.asarray(opt["z_position_in_m"]["pages"]) * M_TO_MM,
+            "px":         np.asarray(opt["x_momentum_direction"]["pages"]),
+            "py":         np.asarray(opt["y_momentum_direction"]["pages"]),
+            "pz":         np.asarray(opt["z_momentum_direction"]["pages"]),
+            "evtid":      np.asarray(opt["evtid"]["pages"]),
+            "det_uid":    np.asarray(opt["det_uid"]["pages"]),
+            "wavelength": np.asarray(opt["wavelength_in_nm"]["pages"]),
             # Emission vertices (positions in mm)
             "v_evtid": np.asarray(vert["evtid"]["pages"]),
             "vx":      np.asarray(vert["xloc_in_m"]["pages"]) * M_TO_MM,
@@ -128,6 +129,25 @@ def load_hdf5_dir(directory: Path) -> dict[str, np.ndarray]:
     print(f"    Total: {len(combined['x'])} optical hits, "
           f"{len(combined['v_evtid'])} vertices")
     return combined
+
+
+def load_particles_wavelength(directory: Path) -> np.ndarray:
+    """
+    Load emitted-photon wavelengths (nm) from the particles table.
+
+    Reads ekin_in_MeV from //hit/particles for every HDF5 file in *directory*,
+    converts to wavelength via λ = hc/E, and returns only entries that fall
+    in the 100–1500 nm range (i.e. genuine optical photons).
+    """
+    files = sorted(directory.glob("*.hdf5")) + sorted(directory.glob("*.h5"))
+    parts: list[np.ndarray] = []
+    for f in files:
+        with h5py.File(f, "r") as hf:
+            ekin_mev = np.asarray(hf["hit"]["particles"]["ekin_in_MeV"]["pages"],
+                                  dtype=np.float64)
+        wl = HC_EV_NM / (ekin_mev * 1e6)
+        parts.append(wl)
+    return np.concatenate(parts) if parts else np.array([], dtype=float)
 
 
 def load_and_filter_hdf5_dir(
@@ -185,10 +205,11 @@ def load_and_filter_hdf5_dir(
             )
 
         kept.append({
-            "x":       fdata["x"][vmask],
-            "y":       fdata["y"][vmask],
-            "z":       fdata["z"][vmask],
-            "det_uid": fdata["det_uid"][vmask],
+            "x":          fdata["x"][vmask],
+            "y":          fdata["y"][vmask],
+            "z":          fdata["z"][vmask],
+            "det_uid":    fdata["det_uid"][vmask],
+            "wavelength": fdata["wavelength"][vmask],
         })
         # fdata (vertices + full hit arrays) freed here
 
@@ -293,9 +314,12 @@ def apply_validity_filter(
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
+        # Only flag outside-in photons on the Tyvek/SSD surface;
+        # PMT cathode hits can arrive from any angle (wide acceptance cone).
+        tyvek_mask = data["det_uid"] == TYVEK_DETECTOR_ID
         n_active = _outward_normal_sphere(hit_pos)
         dot = np.sum(momentum * n_active, axis=1)
-        momentum_invalid = valid & (dot > 0)
+        momentum_invalid = valid & tyvek_mask & (dot > 0)
         valid[momentum_invalid] = False
 
     elif geometry == "sphere_in_sphere":
@@ -306,10 +330,12 @@ def apply_validity_filter(
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
-        inner_mask = data["det_uid"] == INNER_SPHERE_DETECTOR_ID
-        n_active = _outward_normal_sphere(hit_pos, inner_sphere_hits=inner_mask)
+        # Only flag outside-in photons on the Tyvek/SSD surface;
+        # PMTs and the inner sphere are excluded from the directional check.
+        tyvek_mask = data["det_uid"] == TYVEK_DETECTOR_ID
+        n_active = _outward_normal_sphere(hit_pos)
         dot = np.sum(momentum * n_active, axis=1)
-        momentum_invalid = valid & (dot > 0)
+        momentum_invalid = valid & tyvek_mask & (dot > 0)
         valid[momentum_invalid] = False
 
     elif geometry == "wall":
@@ -559,17 +585,25 @@ def analyze_total_hits(
     ssd_hits = ssd_valid & (ssd_data["det_uid"] == TYVEK_DETECTOR_ID)
     n_ssd = int(ssd_hits.sum())
 
-    # PMT+Tyvek: only PMT cathode hits
-    pmt_hits = pmt_valid & (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
-    n_pmt = int(pmt_hits.sum())
+    # PMT+Tyvek: all hits on Tyvek wall + PMT cathodes
+    pmt_all_mask = pmt_valid & (
+        (pmt_data["det_uid"] == TYVEK_DETECTOR_ID) |
+        (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
+    )
+    n_pmt_all = int(pmt_all_mask.sum())
 
-    eps_global = n_pmt / n_ssd if n_ssd > 0 else float("nan")
+    # PMT+Tyvek: PMT cathode hits only
+    pmt_cathode_mask = pmt_valid & (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
+    n_pmt_cathode = int(pmt_cathode_mask.sum())
 
-    print(f"  SSD total hits:        {n_ssd}")
-    print(f"  PMT+Tyvek total hits:  {n_pmt}")
+    eps_global = n_pmt_cathode / n_ssd if n_ssd > 0 else float("nan")
+
+    print(f"  SSD total hits:             {n_ssd}")
+    print(f"  PMT+Tyvek total hits:       {n_pmt_all}")
+    print(f"  PMT cathode hits:           {n_pmt_cathode}")
     print(f"  ε_global = N_PMT / N_SSD = {eps_global:.6f}")
 
-    results = {"n_ssd": n_ssd, "n_pmt": n_pmt, "eps_global": eps_global}
+    results = {"n_ssd": n_ssd, "n_pmt_all": n_pmt_all, "n_pmt_cathode": n_pmt_cathode, "eps_global": eps_global}
 
     # Inner sphere check (sphere_in_sphere)
     if geometry == "sphere_in_sphere":
@@ -603,19 +637,23 @@ def analyze_total_hits(
         print(f"  Saved: {out}")
 
     # Optionally include pmt_no_tyvek
-    datasets = {"SSD": n_ssd, "PMT+Tyvek": n_pmt}
+    datasets = {
+        "SSD": n_ssd,
+        "PMT+Tyvek\n(total)": n_pmt_all,
+        "PMT cathode\nonly": n_pmt_cathode,
+    }
     n_notyvek: Optional[int] = None
     if pmt_notyvek_data is not None and pmt_notyvek_valid is not None:
         nt_hits = pmt_notyvek_valid & (pmt_notyvek_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
         n_notyvek = int(nt_hits.sum())
-        datasets["PMT only"] = n_notyvek
+        datasets["PMT only\n(no Tyvek)"] = n_notyvek
         eps_notyvek = n_notyvek / n_ssd if n_ssd > 0 else float("nan")
-        print(f"  PMT-only total hits:   {n_notyvek}  (ε = {eps_notyvek:.6f})")
+        print(f"  PMT-only total hits:        {n_notyvek}  (ε = {eps_notyvek:.6f})")
         results.update({"n_pmt_notyvek": n_notyvek, "eps_pmt_notyvek": eps_notyvek})
 
     # Bar chart
-    fig, ax = plt.subplots(figsize=(7, 5))
-    colors = ["steelblue", "orange", "green"][: len(datasets)]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    colors = ["steelblue", "darkorange", "orange", "green"][: len(datasets)]
     ax.bar(list(datasets.keys()), list(datasets.values()), color=colors, alpha=0.8)
     for i, (label, n) in enumerate(datasets.items()):
         ax.text(i, n + max(datasets.values()) * 0.01, str(n),
@@ -914,7 +952,7 @@ def plot_3d_voxels(
     other = all_centers[~sel_mask]
     if len(other):
         ax.scatter(other[:, 0], other[:, 1], other[:, 2],
-                   c="gray", s=4, alpha=0.3,
+                   c="cornflowerblue", s=20, alpha=0.55,
                    label=f"All voxels ({(~sel_mask).sum()})")
 
     sel = all_centers[sel_mask]
@@ -938,6 +976,65 @@ def plot_3d_voxels(
 
     out = output_dir / "voxels_3d.png"
     plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+
+# ═══════════════════════════ Wavelength Histograms ═══════════════════════════
+
+def plot_wavelength_histograms(
+    ssd_data: dict,
+    pmt_data: dict,
+    ssd_dir: Path,
+    geometry: str,
+    output_dir: Path,
+) -> None:
+    """Side-by-side histograms: emitted photon spectrum vs detected spectrum."""
+    print("\n── Wavelength Histograms ─────────────────────────────────────────────")
+
+    bins = np.linspace(200, 800, 121)
+
+    # ── Emitted photons (from particles table, SSD dataset) ──────────────────
+    print("  Loading emitted-photon wavelengths from particles table …")
+    emit_wl = load_particles_wavelength(ssd_dir)
+    print(f"    {len(emit_wl)} emitted photons in 200–800 nm range")
+
+    # ── Detected photons ─────────────────────────────────────────────────────
+    ssd_surface = ssd_data["det_uid"] == TYVEK_DETECTOR_ID
+    ssd_wl = ssd_data["wavelength"][ssd_surface]
+
+    pmt_cathode = pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE
+    pmt_wl = pmt_data["wavelength"][pmt_cathode]
+
+    print(f"    SSD surface detected:   {len(ssd_wl)}")
+    print(f"    PMT cathode detected:   {len(pmt_wl)}")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: emitted spectrum
+    ax1.hist(emit_wl, bins=bins, color="steelblue", alpha=0.8, density=True)
+    ax1.set_xlabel("Wavelength (nm)")
+    ax1.set_ylabel("Density (normalised)")
+    ax1.set_title("Emitted photon spectrum\n(vertex photons, SSD simulation)")
+    ax1.set_xlim(200, 800)
+    ax1.grid(True, alpha=0.3)
+
+    # Right: detected spectra (SSD + PMT cathode overlaid)
+    ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7, density=True,
+             label=f"SSD surface ({len(ssd_wl):,})")
+    ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7, density=True,
+             label=f"PMT cathode ({len(pmt_wl):,})")
+    ax2.set_xlabel("Wavelength (nm)")
+    ax2.set_ylabel("Density (normalised)")
+    ax2.set_title("Detected photon spectrum")
+    ax2.set_xlim(200, 800)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Photon wavelength spectra — {geometry}", fontsize=13)
+    plt.tight_layout()
+    out = output_dir / "wavelength_histograms.png"
+    plt.savefig(out, dpi=200)
     plt.close(fig)
     print(f"  Saved: {out}")
 
@@ -1058,6 +1155,11 @@ def main() -> None:
 
     # ── 2.5 3D voxel plot ───────────────────────────────────────────────────
     plot_3d_voxels(all_voxels, selected_voxels, args.geometry, args.output_dir)
+
+    # ── Wavelength histograms ────────────────────────────────────────────────
+    plot_wavelength_histograms(
+        ssd_data, pmt_data, args.data_ssd, args.geometry, args.output_dir
+    )
 
     # ── Save summary JSON ───────────────────────────────────────────────────
     summary = {
