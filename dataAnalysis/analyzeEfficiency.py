@@ -800,6 +800,14 @@ def analyze_per_voxel_efficiency(
     bar_w = 0.4
     ax.bar(x_pos - bar_w / 2, ssd_at_pmt, bar_w, label=f"SSD, UID {TYVEK_DETECTOR_ID} (at PMT voxel)", color="steelblue", alpha=0.8)
     ax.bar(x_pos + bar_w / 2, pmt_counts,   bar_w, label="PMT cathode",                               color="orange",   alpha=0.8)
+    # Average hit counts over the PMT voxels (unweighted means) — shows whether
+    # the SSD surface and the PMT cathodes record the same number of hits.
+    avg_ssd_at_pmt = float(ssd_at_pmt.mean()) if n_pmt_vox else 0.0
+    avg_pmt = float(pmt_counts.mean()) if n_pmt_vox else 0.0
+    ax.axhline(avg_ssd_at_pmt, color="steelblue", linestyle="--", linewidth=1.5,
+               label=f"mean SSD / voxel = {avg_ssd_at_pmt:.1f}")
+    ax.axhline(avg_pmt, color="darkorange", linestyle="--", linewidth=1.5,
+               label=f"mean PMT / PMT = {avg_pmt:.1f}")
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax.set_ylabel("Hit count")
@@ -808,13 +816,18 @@ def analyze_per_voxel_efficiency(
     ax.grid(axis="y", alpha=0.3)
 
     ax2 = axes[1]
-    ax2.bar(x_pos, eps_voxel, color="purple", alpha=0.7)
+    ax2.scatter(x_pos, eps_voxel, color="purple", alpha=0.7, s=30, zorder=3)
     ax2.axhline(eps_voxel_global, color="red", linestyle="--",
                 label=f"$\\epsilon_{{voxel}}$ = {eps_voxel_global:.4f}")
     ax2.set_xticks(x_pos)
     ax2.set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax2.set_ylabel("$\\epsilon_{voxel}$")
     ax2.set_title("Per-voxel efficiency correction")
+    # Zoom y-axis to the relevant range of (finite) per-voxel efficiencies
+    if len(eps_finite):
+        lo, hi = float(eps_finite.min()), float(eps_finite.max())
+        pad = (hi - lo) * 0.1 if hi > lo else max(abs(hi) * 0.1, 1e-3)
+        ax2.set_ylim(lo - pad, hi + pad)
     ax2.legend()
     ax2.grid(axis="y", alpha=0.3)
 
@@ -871,6 +884,13 @@ def plot_validity_report(
     x = np.arange(len(labels))
     ax.bar(x, totals, 0.4, label="Total simulated", color="gray", alpha=0.5)
     ax.bar(x, valids, 0.4, label="Valid", color="steelblue", alpha=0.9)
+    # Annotate each bar with its hit count
+    ymax = max(totals) if totals else 0
+    for xi, tot, val in zip(x, totals, valids):
+        ax.text(xi, tot + ymax * 0.01, f"{tot:,}", ha="center", va="bottom",
+                fontsize=8, color="dimgray")
+        ax.text(xi, val + ymax * 0.01, f"{val:,}", ha="center", va="bottom",
+                fontsize=8, color="steelblue")
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
     ax.set_ylabel("Photon count")
@@ -1031,20 +1051,20 @@ def plot_wavelength_histograms(
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
     # Left: emitted spectrum
-    ax1.hist(emit_wl, bins=bins, color="steelblue", alpha=0.8, density=True)
+    ax1.hist(emit_wl, bins=bins, color="steelblue", alpha=0.8)
     ax1.set_xlabel("Wavelength (nm)")
-    ax1.set_ylabel("Density (normalised)")
+    ax1.set_ylabel("Counts")
     ax1.set_title("Emitted photon spectrum\n(vertex photons, SSD simulation)")
     ax1.set_xlim(200, 800)
     ax1.grid(True, alpha=0.3)
 
     # Right: detected spectra (SSD + PMT cathode overlaid)
-    ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7, density=True,
+    ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7,
              label=f"SSD surface, UID {TYVEK_DETECTOR_ID} ({len(ssd_wl):,})")
-    ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7, density=True,
+    ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7,
              label=f"PMT cathode ({len(pmt_wl):,})")
     ax2.set_xlabel("Wavelength (nm)")
-    ax2.set_ylabel("Density (normalised)")
+    ax2.set_ylabel("Counts")
     ax2.set_title("Detected photon spectrum")
     ax2.set_xlim(200, 800)
     ax2.legend(fontsize=9)
@@ -1089,15 +1109,15 @@ def plot_time_distributions(
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
 
-        ax1.hist(t_ssd, bins=bins, color="steelblue", alpha=0.8, density=True)
+        ax1.hist(t_ssd, bins=bins, color="steelblue", alpha=0.8)
         ax1.set_xlabel("Time (ns)")
-        ax1.set_ylabel("Density (normalised)")
+        ax1.set_ylabel("Hit count")
         ax1.set_title(f"{title_ssd}\n{len(t_ssd):,} hits")
         ax1.grid(True, alpha=0.3)
 
-        ax2.hist(t_pmt, bins=bins, color="orange", alpha=0.8, density=True)
+        ax2.hist(t_pmt, bins=bins, color="orange", alpha=0.8)
         ax2.set_xlabel("Time (ns)")
-        ax2.set_ylabel("Density (normalised)")
+        ax2.set_ylabel("Hit count")
         ax2.set_title(f"{title_pmt}\n{len(t_pmt):,} hits")
         ax2.grid(True, alpha=0.3)
 
@@ -1110,14 +1130,17 @@ def plot_time_distributions(
     # ── Outer sphere ──────────────────────────────────────────────────────────
     # SSD simulation: hits on SSD/Tyvek surface (UID 1000)
     ssd_outer_t = ssd_data["time"][ssd_data["det_uid"] == TYVEK_DETECTOR_ID]
-    # PMT+Tyvek simulation: PMT cathode hits (UID ≥ 10000); Tyvek wall is
-    # a pure reflector and records no hits in this setup.
-    pmt_outer_t = pmt_data["time"][pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE]
+    # PMT+Tyvek simulation: PMT cathode hits (UID ≥ 10000) together with
+    # Tyvek wall hits (UID 1000).
+    pmt_outer_t = pmt_data["time"][
+        (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
+        | (pmt_data["det_uid"] == TYVEK_DETECTOR_ID)
+    ]
 
     _hist_pair(
         ssd_outer_t, pmt_outer_t,
         title_ssd=f"SSD (UID {TYVEK_DETECTOR_ID})",
-        title_pmt=f"PMT+Tyvek — cathode (UID ≥ {PMT_DETECTOR_ID_BASE})",
+        title_pmt=f"PMT+Tyvek — cathode (UID ≥ {PMT_DETECTOR_ID_BASE}) + Tyvek (UID {TYVEK_DETECTOR_ID})",
         suptitle=f"Outer sphere hit time distribution — {geometry}",
         filename=output_dir / "time_distribution_outer.png",
     )
