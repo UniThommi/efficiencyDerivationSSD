@@ -336,13 +336,16 @@ def apply_validity_filter(
         # counted for diagnostics only — not removed from valid
 
     elif geometry == "wall":
-        # Assumes photon source is on the +z side of the wall.
+        # Source is on the -z side of the wall; photons travel toward +z.
+        # (Matches createGeometry.py: wall PMTs face -z, so the active volume
+        #  — and hence the photon source — lies on the -z side of the wall.)
         vert_z = vertex_pos[:, 2]
-        vertex_outside = vertex_found & (vert_z < WALL_Z_MM / 2.0)
+        vertex_outside = vertex_found & (vert_z > -WALL_Z_MM / 2.0)
         valid[vertex_outside] = False
         n_invalid_vertex = int(vertex_outside.sum())
 
-        dot = data["pz"]
+        # Outside-in = arriving from the +z side, i.e. travelling toward -z.
+        dot = -data["pz"]
         momentum_invalid = valid & (dot > 0)
         # counted for diagnostics only — not removed from valid
 
