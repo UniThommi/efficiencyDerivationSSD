@@ -39,7 +39,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import PatchCollection
+from matplotlib.patches import Circle, Wedge
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
@@ -61,6 +64,8 @@ PMT_Z_TOP_CUT: float = 200.0          # mm — upper z-cut
 SPHERE_INNER_RADIUS: float = 1739.52  # mm
 SPHERE_THICKNESS: float = 1.0         # mm
 INNER_SPHERE_RADIUS: float = 1000.0   # mm — steel sphere (sphere_in_sphere only)
+SPHERE_N_LAT: int = 25                # latitude bands  → 25 × 40 = 1000 voxels
+SPHERE_N_LON: int = 40                # longitude cells per band (fixed)
 
 WALL_X: float = 1950.0                # mm
 WALL_Y: float = 1950.0                # mm
@@ -203,20 +208,21 @@ def _wall_pmt_placement(voxel: dict) -> tuple[list, list]:
 def generate_sphere_voxels(
     radius: float = SPHERE_INNER_RADIUS,
     pmt_radius: float = PMT_CATHODE_RADIUS,
+    n_lat: int = SPHERE_N_LAT,
+    n_lon: int = SPHERE_N_LON,
 ) -> list[dict]:
     """
-    Generate approximately equal-area voxels on a sphere surface.
+    Generate equal-area voxels on a sphere surface.
 
-    Target voxel area equals one PMT cathode area (pi * pmt_radius^2).
-    Uses equal solid-angle latitude bands with uniform longitude spacing.
+    Uses a *fixed* ``n_lat × n_lon`` equal-solid-angle grid (default 25 × 40 =
+    1000 voxels): equal-area latitude bands (uniform in cos θ) each split into
+    the same n_lon longitude cells, so every voxel has identical area
+    4πR²/(n_lat·n_lon).  The 25 × 40 factorisation hits the PMT-equivalence
+    target (≈1000) exactly.
     """
     pmt_area = np.pi * pmt_radius**2
     sphere_area = 4.0 * np.pi * radius**2
     target_count = int(round(sphere_area / pmt_area))
-
-    # Equal-area latitude bands: each band covers 1/n_lat of solid angle
-    n_lat = int(round(np.sqrt(target_count / 2.0)))
-    n_lon = int(round(target_count / n_lat))
     total = n_lat * n_lon
 
     print(f"Sphere voxel grid: {n_lat} lat × {n_lon} lon = {total} voxels "
@@ -228,8 +234,8 @@ def generate_sphere_voxels(
 
     voxels: list[dict] = []
     idx = 0
-    for t in theta_arr:
-        for p in phi_arr:
+    for i_lat, t in enumerate(theta_arr):
+        for i_lon, p in enumerate(phi_arr):
             voxels.append({
                 "index": f"{idx:06d}",
                 "center": [
@@ -238,6 +244,10 @@ def generate_sphere_voxels(
                     float(radius * np.cos(t)),
                 ],
                 "layer": "sphere",
+                "grid_ilat": i_lat,
+                "grid_ilon": i_lon,
+                "n_lat": n_lat,
+                "n_lon": n_lon,
             })
             idx += 1
     return voxels
@@ -433,6 +443,188 @@ def plot_voxels_3d(
     print(f"  Saved: {filename}")
 
 
+# ──────────────────── Sphere voxelisation plots (edges / disks) ────────────────
+
+def _infer_sphere_grid(all_voxels: list[dict]) -> tuple[int, int]:
+    """Recover (n_lat, n_lon) of a sphere voxel grid, from stored fields if
+    present, otherwise from the number of distinct latitude (z) levels."""
+    first = all_voxels[0]
+    if "n_lat" in first and "n_lon" in first:
+        return int(first["n_lat"]), int(first["n_lon"])
+    zs = np.array([v["center"][2] for v in all_voxels])
+    n_lat = len(np.unique(np.round(zs, 3)))
+    n_lon = len(all_voxels) // max(n_lat, 1)
+    return n_lat, n_lon
+
+
+def _sphere_point(theta: float, phi: float, radius: float) -> tuple:
+    return (
+        radius * np.sin(theta) * np.cos(phi),
+        radius * np.sin(theta) * np.sin(phi),
+        radius * np.cos(theta),
+    )
+
+
+def _sphere_cell_bounds(i: int, j: int, n_lat: int, n_lon: int) -> tuple:
+    """Angular bounds (theta_top, theta_bot, phi_left, phi_right) of cell (i, j)."""
+    theta_top = float(np.arccos(np.clip(1.0 - 2.0 * i / n_lat, -1.0, 1.0)))
+    theta_bot = float(np.arccos(np.clip(1.0 - 2.0 * (i + 1) / n_lat, -1.0, 1.0)))
+    d_phi = 2.0 * np.pi / n_lon
+    phi_c = j * d_phi
+    return theta_top, theta_bot, phi_c - d_phi / 2.0, phi_c + d_phi / 2.0
+
+
+def _cell_boundary_loop(
+    theta_top: float, theta_bot: float, phi_left: float, phi_right: float,
+    radius: float, n: int = 12,
+) -> list:
+    """Closed 3D point loop tracing the four edges of a spherical cell."""
+    th = np.linspace(theta_top, theta_bot, n)
+    ph = np.linspace(phi_left, phi_right, n)
+    pts = [_sphere_point(theta_top, p, radius) for p in ph]            # top arc
+    pts += [_sphere_point(t, phi_right, radius) for t in th]           # right meridian
+    pts += [_sphere_point(theta_bot, p, radius) for p in ph[::-1]]     # bottom arc
+    pts += [_sphere_point(t, phi_left, radius) for t in th[::-1]]      # left meridian
+    return pts
+
+
+def plot_sphere_voxels_3d_edges(
+    all_voxels: list[dict],
+    selected_indices: list[int],
+    radius: float,
+    filename: str,
+) -> None:
+    """3D sphere with the voxel cell *edges* drawn (latitude circles + meridian
+    boundaries); PMT-selected voxels are filled green."""
+    n_lat, n_lon = _infer_sphere_grid(all_voxels)
+    d_phi = 2.0 * np.pi / n_lon
+
+    fig = plt.figure(figsize=(11, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Faint reference surface.
+    u = np.linspace(0, 2 * np.pi, 60)
+    v = np.linspace(0, np.pi, 60)
+    ax.plot_surface(
+        radius * np.outer(np.cos(u), np.sin(v)),
+        radius * np.outer(np.sin(u), np.sin(v)),
+        radius * np.outer(np.ones_like(u), np.cos(v)),
+        alpha=0.05, color="lightblue", edgecolor="none",
+    )
+
+    # Latitude band edges (interior circles).
+    phi_line = np.linspace(0, 2 * np.pi, 200)
+    for i in range(1, n_lat):
+        theta_e = np.arccos(1.0 - 2.0 * i / n_lat)
+        ax.plot(radius * np.sin(theta_e) * np.cos(phi_line),
+                radius * np.sin(theta_e) * np.sin(phi_line),
+                radius * np.cos(theta_e) * np.ones_like(phi_line),
+                color="gray", lw=0.4, alpha=0.6)
+
+    # Longitude cell boundaries (full pole-to-pole meridians, since n_lon is
+    # constant across bands).
+    theta_line = np.linspace(0, np.pi, 200)
+    for j in range(n_lon):
+        phi_e = (j + 0.5) * d_phi
+        ax.plot(radius * np.sin(theta_line) * np.cos(phi_e),
+                radius * np.sin(theta_line) * np.sin(phi_e),
+                radius * np.cos(theta_line),
+                color="gray", lw=0.4, alpha=0.6)
+
+    # Selected (PMT) voxels as filled spherical patches.
+    polys = []
+    for k in selected_indices:
+        i, j = divmod(int(k), n_lon)
+        polys.append(_cell_boundary_loop(*_sphere_cell_bounds(i, j, n_lat, n_lon), radius))
+    if polys:
+        ax.add_collection3d(Poly3DCollection(
+            polys, facecolor="green", edgecolor="darkgreen",
+            alpha=0.6, linewidths=0.8))
+
+    ax.set_xlabel("X [mm]")
+    ax.set_ylabel("Y [mm]")
+    ax.set_zlabel("Z [mm]")
+    ax.set_title(
+        f"Sphere voxel edges — {n_lat}×{n_lon} = {len(all_voxels)} voxels, "
+        f"{len(selected_indices)} PMTs")
+    ax.set_box_aspect([1, 1, 1])
+    plt.tight_layout()
+    plt.savefig(filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {filename}")
+
+
+def plot_sphere_voxels_2d_circular(
+    all_voxels: list[dict],
+    selected_indices: list[int],
+    radius: float,
+    filename: str,
+) -> None:
+    """2D circular voxelisation: two Lambert azimuthal equal-area disks (north +
+    south hemisphere). Latitude bands → concentric rings, longitude cells →
+    sectors; PMT-selected voxels are filled green."""
+    n_lat, n_lon = _infer_sphere_grid(all_voxels)
+    sel_set = {int(k) for k in selected_indices}
+
+    def rho(theta: float) -> float:           # azimuthal equal-area radius from pole
+        return 2.0 * radius * np.sin(theta / 2.0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    for hemi, ax in zip(("north", "south"), axes):
+        patches, r_max = [], 0.0
+        for k, _vox in enumerate(all_voxels):
+            i, j = divmod(k, n_lon)
+            cos_c = 1.0 - 2.0 * (i + 0.5) / n_lat
+            in_north = cos_c >= 0.0
+            if (hemi == "north") != in_north:
+                continue
+            th_t, th_b, ph_l, ph_r = _sphere_cell_bounds(i, j, n_lat, n_lon)
+            if hemi == "north":
+                inner, outer = rho(th_t), rho(th_b)
+                a1, a2 = np.degrees(ph_l), np.degrees(ph_r)
+            else:                              # view from -z: mirror longitude
+                inner, outer = rho(np.pi - th_b), rho(np.pi - th_t)
+                a1, a2 = np.degrees(-ph_r), np.degrees(-ph_l)
+            r_max = max(r_max, outer)
+            w = Wedge((0.0, 0.0), outer, a1, a2, width=outer - inner)
+            if k in sel_set:
+                w.set_facecolor("green")
+                w.set_edgecolor("darkgreen")
+                w.set_linewidth(0.6)
+            else:
+                w.set_facecolor("whitesmoke")
+                w.set_edgecolor("gray")
+                w.set_linewidth(0.4)
+            patches.append(w)
+
+        ax.add_collection(PatchCollection(patches, match_original=True))
+        ax.add_patch(Circle((0, 0), rho(np.pi / 2.0), fill=False,
+                            ec="black", lw=1.0, ls="--"))   # equator
+        lim = r_max * 1.05
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{hemi.capitalize()} hemisphere", fontsize=12)
+
+    n_pmt = len(sel_set)
+    handles = [
+        plt.Line2D([0], [0], marker="s", color="w", markerfacecolor="whitesmoke",
+                   markeredgecolor="gray", markersize=12, label="voxel"),
+        plt.Line2D([0], [0], marker="s", color="w", markerfacecolor="green",
+                   markeredgecolor="darkgreen", markersize=12,
+                   label=f"PMT voxel ({n_pmt})"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=2, fontsize=10)
+    fig.suptitle(
+        f"Sphere voxelisation (azimuthal equal-area) — {n_lat}×{n_lon} = "
+        f"{len(all_voxels)} voxels", fontsize=13)
+    plt.tight_layout(rect=(0, 0.04, 1, 0.97))
+    plt.savefig(filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {filename}")
+
+
 # ══════════════════════════ Reflectivity Calculation ═════════════════════════
 
 def calc_ssd_reflectivity(geometry: str, n_pmts: int) -> None:
@@ -618,6 +810,12 @@ def build_sphere_geometry(
     print(f"\n=== Plotting voxels ===")
     plot_voxels_3d(all_voxels, selected_indices, "sphere", plot_filename,
                    sphere_radius=SPHERE_INNER_RADIUS)
+
+    base = plot_filename[:-4] if plot_filename.lower().endswith(".png") else plot_filename
+    plot_sphere_voxels_3d_edges(
+        all_voxels, selected_indices, SPHERE_INNER_RADIUS, base + "_edges3d.png")
+    plot_sphere_voxels_2d_circular(
+        all_voxels, selected_indices, SPHERE_INNER_RADIUS, base + "_circular2d.png")
 
     _print_sphere_summary(all_voxels, selected_indices, voxels_file, out_filename, plot_filename)
 
