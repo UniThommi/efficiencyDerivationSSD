@@ -363,6 +363,27 @@ def select_wall_pmts(voxels: list[dict], n_select: int) -> list[int]:
     return sorted(set(int(i) for i in indices))
 
 
+# Fixed wall PMT layout: 5 hand-picked voxels (overrides Fibonacci selection
+# when --fixed-voxels is given). Each becomes PMT<index> via the usual naming.
+FIXED_WALL_VOXEL_INDICES: list[str] = ["0202", "0208", "0505", "0802", "0808"]
+
+
+def select_fixed_wall_pmts(voxels: list[dict], wanted: list[str]) -> list[int]:
+    """
+    Select the voxels whose "index" matches the given list, preserving the
+    order of `wanted`. Errors if any requested index is not in the grid.
+    """
+    by_index = {str(v["index"]): i for i, v in enumerate(voxels)}
+    missing = [idx for idx in wanted if idx not in by_index]
+    if missing:
+        raise ValueError(
+            f"Fixed voxel indices not present in the voxel grid: {missing}. "
+            f"Available example indices: {sorted(by_index)[:5]} ... "
+            f"(grid has {len(voxels)} voxels)."
+        )
+    return [by_index[idx] for idx in wanted]
+
+
 def compute_homogeneity(selected_centers: np.ndarray) -> dict:
     """
     Compute nearest-neighbour distance statistics as a homogeneity metric.
@@ -829,6 +850,7 @@ def build_wall_geometry(
     n_pmts: int,
     plot_filename: str,
     world_is_vacuum: bool,
+    fixed_voxels: bool = False,
 ) -> None:
     """Build wall geometry in the requested variant (ssd / pmt / pmt_no_tyvek)."""
     reg = geant4.Registry()
@@ -871,11 +893,16 @@ def build_wall_geometry(
             all_voxels = json.load(f)
         print(f"  {len(all_voxels)} voxels loaded")
 
-        print(f"\n=== Selecting {n_pmts} PMT positions (2D Fibonacci) ===")
-        selected_indices = select_wall_pmts(all_voxels, n_pmts)
-        actual_n = len(selected_indices)
-        if actual_n < n_pmts:
-            print(f"  Warning: only {actual_n} unique voxels selected (requested {n_pmts})")
+        if fixed_voxels:
+            print(f"\n=== Selecting fixed PMT positions {FIXED_WALL_VOXEL_INDICES} ===")
+            selected_indices = select_fixed_wall_pmts(all_voxels, FIXED_WALL_VOXEL_INDICES)
+            actual_n = len(selected_indices)
+        else:
+            print(f"\n=== Selecting {n_pmts} PMT positions (2D Fibonacci) ===")
+            selected_indices = select_wall_pmts(all_voxels, n_pmts)
+            actual_n = len(selected_indices)
+            if actual_n < n_pmts:
+                print(f"  Warning: only {actual_n} unique voxels selected (requested {n_pmts})")
 
         sel_voxels = [all_voxels[i] for i in selected_indices]
         selected_file = voxels_file.replace(".json", "_selected.json")
@@ -988,8 +1015,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--n-pmts", type=int, default=50,
+        "--n-pmts", type=int, default=None,
         help="Number of PMTs to place (pmt/pmt_no_tyvek variants only, default: 50)",
+    )
+    parser.add_argument(
+        "--fixed-voxels", action="store_true",
+        help=(
+            "Wall pmt/pmt_no_tyvek only: place 5 PMTs at the fixed voxels "
+            f"{FIXED_WALL_VOXEL_INDICES} instead of the Fibonacci selection."
+        ),
     )
     parser.add_argument(
         "--out", type=str, default=None,
@@ -1013,10 +1047,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Resolve effective PMT count (None default lets us detect an explicit value
+    # for the --fixed-voxels conflict check below).
+    n_pmts = 50 if args.n_pmts is None else args.n_pmts
+
     # ── calc_reflectivity: print table and exit ──────────────────────────────
     if args.variant == "calc_reflectivity":
-        calc_ssd_reflectivity(args.geometry, args.n_pmts)
+        calc_ssd_reflectivity(args.geometry, n_pmts)
         return
+
+    # ── --fixed-voxels validation ────────────────────────────────────────────
+    if args.fixed_voxels:
+        if args.geometry != "wall":
+            parser.error("--fixed-voxels is only valid for --geometry wall")
+        if args.variant not in ("pmt", "pmt_no_tyvek"):
+            parser.error("--fixed-voxels is only valid for --variant pmt or pmt_no_tyvek")
+        if args.n_pmts is not None and args.n_pmts != len(FIXED_WALL_VOXEL_INDICES):
+            parser.error(
+                f"--fixed-voxels places exactly {len(FIXED_WALL_VOXEL_INDICES)} PMTs; "
+                f"--n-pmts {args.n_pmts} conflicts. Omit --n-pmts or pass "
+                f"--n-pmts {len(FIXED_WALL_VOXEL_INDICES)}."
+            )
 
     # Validate combinations for GDML-generating variants
     if args.out is None:
@@ -1039,7 +1090,10 @@ def main() -> None:
     print(f"  geometry: {args.geometry}")
     print(f"  variant:  {args.variant}")
     if args.variant != "ssd":
-        print(f"  n_pmts:   {args.n_pmts}")
+        if args.fixed_voxels:
+            print(f"  n_pmts:   {len(FIXED_WALL_VOXEL_INDICES)} (fixed: {FIXED_WALL_VOXEL_INDICES})")
+        else:
+            print(f"  n_pmts:   {n_pmts}")
     print(f"  out:      {args.out}")
     print(f"  voxels:   {args.voxels}")
     print(f"  vacuum:   {args.vacuum}")
@@ -1050,7 +1104,7 @@ def main() -> None:
             variant=args.variant,
             out_filename=args.out,
             voxels_file=args.voxels,
-            n_pmts=args.n_pmts,
+            n_pmts=n_pmts,
             plot_filename=plot_file,
             world_is_vacuum=args.vacuum,
             with_inner_sphere=False,
@@ -1060,7 +1114,7 @@ def main() -> None:
             variant=args.variant,
             out_filename=args.out,
             voxels_file=args.voxels,
-            n_pmts=args.n_pmts,
+            n_pmts=n_pmts,
             plot_filename=plot_file,
             world_is_vacuum=args.vacuum,
             with_inner_sphere=True,
@@ -1070,9 +1124,10 @@ def main() -> None:
             variant=args.variant,
             out_filename=args.out,
             voxels_file=args.voxels,
-            n_pmts=args.n_pmts,
+            n_pmts=n_pmts,
             plot_filename=plot_file,
             world_is_vacuum=args.vacuum,
+            fixed_voxels=args.fixed_voxels,
         )
 
 
