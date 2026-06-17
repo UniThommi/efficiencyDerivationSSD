@@ -37,6 +37,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.optimize import curve_fit
 from scipy.spatial import cKDTree
 
 # ══════════════════════════════════ Constants ══════════════════════════════════
@@ -1092,6 +1093,43 @@ def plot_time_distributions(
     """Hit-time histograms for outer and (if sphere_in_sphere) inner sphere."""
     print("\n── Time Distributions ────────────────────────────────────────────────")
 
+    def _fit_exp_decay(
+        t_data: np.ndarray, bins: np.ndarray, label: str,
+    ) -> Optional[tuple]:
+        """Fit f(t) = A·exp(-(t - t0)/tau) to the hit-time histogram.
+
+        t0 is fixed to the first detected hit time (data minimum); A and tau
+        are fitted over the full histogram range. Returns
+        (A, t0, tau, t_curve, y_curve) or None if the fit is not possible.
+        """
+        if len(t_data) < 2:
+            return None
+
+        counts, edges = np.histogram(t_data, bins=bins)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        t0 = float(t_data.min())
+
+        # Model with t0 held fixed at the first-hit time.
+        def model(t, A, tau):
+            return A * np.exp(-(t - t0) / tau)
+
+        A0 = float(counts.max()) if counts.max() > 0 else 1.0
+        tau0 = max((bins[-1] - bins[0]) / 3.0, 1.0)
+        try:
+            popt, _ = curve_fit(
+                model, centers, counts, p0=(A0, tau0),
+                bounds=([0.0, 1e-6], [np.inf, np.inf]), maxfev=10000,
+            )
+        except (RuntimeError, ValueError) as exc:
+            print(f"    {label} fit failed: {exc}")
+            return None
+
+        A, tau = float(popt[0]), float(popt[1])
+        t_curve = np.linspace(t0, float(bins[-1]), 400)
+        y_curve = model(t_curve, A, tau)
+        print(f"    {label} fit: A = {A:.0f}, t0 = {t0:.1f} ns, tau = {tau:.1f} ns")
+        return A, t0, tau, t_curve, y_curve
+
     def _hist_pair(
         t_ssd: np.ndarray,
         t_pmt: np.ndarray,
@@ -1099,6 +1137,7 @@ def plot_time_distributions(
         title_pmt: str,
         suptitle: str,
         filename: Path,
+        fit: bool = False,
     ) -> None:
         t_min = min(
             t_ssd.min() if len(t_ssd) else 0.0,
@@ -1124,6 +1163,95 @@ def plot_time_distributions(
         ax2.set_title(f"{title_pmt}\n{len(t_pmt):,} hits")
         ax2.grid(True, alpha=0.3)
 
+        if fit:
+            ssd_fit = _fit_exp_decay(t_ssd, bins, "SSD")
+            if ssd_fit is not None:
+                A, t0, tau, t_curve, y_curve = ssd_fit
+                ax1.plot(
+                    t_curve, y_curve, color="darkblue", lw=2.0,
+                    label=f"SSD fit: A = {A:.0f}, t₀ = {t0:.1f} ns, "
+                          f"τ = {tau:.1f} ns",
+                )
+                ax1.legend(fontsize=9)
+
+            pmt_fit = _fit_exp_decay(t_pmt, bins, "PMTs+T")
+            if pmt_fit is not None:
+                A, t0, tau, t_curve, y_curve = pmt_fit
+                ax2.plot(
+                    t_curve, y_curve, color="darkred", lw=2.0,
+                    label=f"PMTs+T fit: A = {A:.0f}, t₀ = {t0:.1f} ns, "
+                          f"τ = {tau:.1f} ns",
+                )
+                ax2.legend(fontsize=9)
+
+        fig.suptitle(suptitle, fontsize=13)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200)
+        plt.close(fig)
+        print(f"  Saved: {filename}")
+
+    def _hist_pair_split(
+        t_ssd: np.ndarray,
+        t_pmt_tyvek: np.ndarray,
+        t_pmt_cathode: np.ndarray,
+        title_ssd: str,
+        title_pmt: str,
+        suptitle: str,
+        filename: Path,
+    ) -> None:
+        """Like _hist_pair, but the PMT side shows the Tyvek-wall and PMT-cathode
+        hits as two separate overlaid distributions, each fitted independently."""
+        series = [t_ssd, t_pmt_tyvek, t_pmt_cathode]
+        t_min = min((t.min() for t in series if len(t)), default=0.0)
+        t_max = max((t.max() for t in series if len(t)), default=1.0)
+        bins = np.linspace(t_min, t_max, 101)
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+        # ── SSD (left) — identical to the outer plot ──────────────────────────
+        ax1.hist(t_ssd, bins=bins, color="steelblue", alpha=0.8)
+        ax1.set_xlabel("Time (ns)")
+        ax1.set_ylabel("Hit count")
+        ax1.set_title(f"{title_ssd}\n{len(t_ssd):,} hits")
+        ax1.grid(True, alpha=0.3)
+
+        ssd_fit = _fit_exp_decay(t_ssd, bins, "SSD")
+        if ssd_fit is not None:
+            A, t0, tau, t_curve, y_curve = ssd_fit
+            ax1.plot(
+                t_curve, y_curve, color="darkblue", lw=2.0,
+                label=f"SSD fit: A = {A:.0f}, t₀ = {t0:.1f} ns, τ = {tau:.1f} ns",
+            )
+            ax1.legend(fontsize=9)
+
+        # ── PMT side (right) — Tyvek wall + PMT cathode, plotted separately ────
+        ax2.hist(t_pmt_tyvek, bins=bins, color="orange", alpha=0.6,
+                 label=f"Tyvek wall ({len(t_pmt_tyvek):,} hits)")
+        ax2.hist(t_pmt_cathode, bins=bins, color="seagreen", alpha=0.6,
+                 label=f"PMT cathode ({len(t_pmt_cathode):,} hits)")
+        ax2.set_xlabel("Time (ns)")
+        ax2.set_ylabel("Hit count")
+        ax2.set_title(f"{title_pmt}")
+        ax2.grid(True, alpha=0.3)
+
+        tyvek_fit = _fit_exp_decay(t_pmt_tyvek, bins, "Tyvek")
+        if tyvek_fit is not None:
+            A, t0, tau, t_curve, y_curve = tyvek_fit
+            ax2.plot(
+                t_curve, y_curve, color="darkorange", lw=2.0,
+                label=f"Tyvek fit: A = {A:.0f}, t₀ = {t0:.1f} ns, τ = {tau:.1f} ns",
+            )
+
+        cathode_fit = _fit_exp_decay(t_pmt_cathode, bins, "PMTs")
+        if cathode_fit is not None:
+            A, t0, tau, t_curve, y_curve = cathode_fit
+            ax2.plot(
+                t_curve, y_curve, color="darkgreen", lw=2.0,
+                label=f"PMTs fit: A = {A:.0f}, t₀ = {t0:.1f} ns, τ = {tau:.1f} ns",
+            )
+
+        ax2.legend(fontsize=9)
+
         fig.suptitle(suptitle, fontsize=13)
         plt.tight_layout()
         plt.savefig(filename, dpi=200)
@@ -1146,6 +1274,19 @@ def plot_time_distributions(
         title_pmt=f"PMT+Tyvek — cathode (UID ≥ {PMT_DETECTOR_ID_BASE}) + Tyvek (UID {TYVEK_DETECTOR_ID})",
         suptitle=f"Outer sphere hit time distribution — {geometry}",
         filename=output_dir / "time_distribution_outer.png",
+        fit=True,
+    )
+
+    # ── Outer sphere (PMT side split into Tyvek wall + PMT cathode) ───────────
+    pmt_tyvek_t = pmt_data["time"][pmt_data["det_uid"] == TYVEK_DETECTOR_ID]
+    pmt_cathode_t = pmt_data["time"][pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE]
+
+    _hist_pair_split(
+        ssd_outer_t, pmt_tyvek_t, pmt_cathode_t,
+        title_ssd=f"SSD (UID {TYVEK_DETECTOR_ID})",
+        title_pmt=f"PMT+Tyvek — Tyvek (UID {TYVEK_DETECTOR_ID}) + cathode (UID ≥ {PMT_DETECTOR_ID_BASE})",
+        suptitle=f"Outer sphere hit time distribution (split) — {geometry}",
+        filename=output_dir / "time_distribution_outer_split.png",
     )
 
     # ── Inner sphere (sphere_in_sphere only) ──────────────────────────────────
