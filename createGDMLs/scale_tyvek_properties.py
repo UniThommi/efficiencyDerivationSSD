@@ -68,15 +68,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-r",
         "--reflectivity-factor",
         type=str,
-        required=True,
-        help="Multiplicative factor for my_tyvek_foil_surface_REFLECTIVITY values.",
+        default="1.0",
+        help=(
+            "Multiplicative factor for my_tyvek_foil_surface_REFLECTIVITY values. "
+            "Defaults to 1.0 (no change)."
+        ),
     )
     parser.add_argument(
         "-e",
         "--efficiency-factor",
         type=str,
-        required=True,
-        help="Multiplicative factor for my_tyvek_foil_surface_EFFICIENCY values.",
+        default="1.0",
+        help=(
+            "Multiplicative factor for my_tyvek_foil_surface_EFFICIENCY values. "
+            "Defaults to 1.0 (no change)."
+        ),
     )
     parser.add_argument(
         "-o",
