@@ -130,6 +130,8 @@ def scale_values_string(values: str, factor: float) -> tuple[str, int]:
     Raises:
         ValueError: if the token layout does not match the expected
             ``energy value energy value ...`` pattern.
+        RuntimeError: if any scaled property value falls outside the physical
+            range [0, 1].
     """
     tokens = values.split()
     if not tokens:
@@ -139,6 +141,13 @@ def scale_values_string(values: str, factor: float) -> tuple[str, int]:
             f"expected an even number of tokens (energy/value pairs), "
             f"got {len(tokens)}."
         )
+
+    # The largest property value is the binding constraint for the upper bound:
+    # the highest factor keeping every scaled value <= 1 is 1 / max(value).
+    max_value = max(
+        (float(tok) for i, tok in enumerate(tokens) if i % 2 == 1),
+        default=0.0,
+    )
 
     out_tokens: list[str] = []
     n_scaled = 0
@@ -160,7 +169,20 @@ def scale_values_string(values: str, factor: float) -> tuple[str, int]:
                     f"expected a numeric property value at position {i}, "
                     f"got {tok!r}."
                 ) from exc
-            out_tokens.append(repr(value * factor))
+            scaled = value * factor
+            if not 0.0 <= scaled <= 1.0:
+                msg = (
+                    f"scaled property value out of the physical range [0, 1] at "
+                    f"token {i}: {value!r} * {factor!r} = {scaled!r}."
+                )
+                if scaled > 1.0 and max_value > 0.0:
+                    msg += (
+                        f" The highest factor that keeps all values <= 1 is "
+                        f"{1.0 / max_value!r} (= 1 / {max_value!r}, the largest "
+                        f"property value in this matrix)."
+                    )
+                raise RuntimeError(msg)
+            out_tokens.append(repr(scaled))
             n_scaled += 1
 
     return " ".join(out_tokens), n_scaled
@@ -200,6 +222,8 @@ def scale_matrix_in_text(text: str, matrix_name: str, factor: float) -> tuple[st
         new_values, n_scaled = scale_values_string(values_match.group(1), factor)
     except ValueError as exc:
         raise ValueError(f"matrix {matrix_name!r}: {exc}") from exc
+    except RuntimeError as exc:
+        raise RuntimeError(f"matrix {matrix_name!r}: {exc}") from exc
 
     new_values_attr = f'values="{new_values}"'
     new_tag = tag[: values_match.start()] + new_values_attr + tag[values_match.end() :]
