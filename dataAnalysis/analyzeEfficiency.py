@@ -2,12 +2,20 @@
 """
 SSD vs. PMT+Tyvek efficiency analysis script.
 
+Geometries: wall | sphere | sphere_in_sphere | detector. The "detector" geometry
+is the LEGEND-1000 cylinder (outer foil surfaces UID 1965/1966/1967/1968 =
+wall/pit/bot/top, inner steel spheres UID 9000/9001/9002, and 300 PMTs whose
+8-digit det_uid encodes the voxel index). For the detector geometry no validity
+filter is applied (all hits are kept) and section 2.2 is skipped.
+
 Analyses performed (in order):
   2.1  Photon validity filter (vertex position + momentum direction)
   2.2  GDML reflectivity verification (SSD surface vs. analytic formula)
   2.3  Total hit comparison (SSD vs. PMT+Tyvek, global efficiency correction)
   2.4  Per-voxel efficiency analysis
   2.5  3D voxel visualisation
+  +    3D emission-vertex scatter (all scenarios), wavelength + time distributions
+       (detector: per-surface and combined)
 
 Usage:
   python analyzeEfficiency.py \\
@@ -49,6 +57,24 @@ TYVEK_DETECTOR_ID: int = 1000        # SSD / Tyvek wall rawid
 INNER_SPHERE_DETECTOR_ID: int = 9000
 PMT_DETECTOR_ID_BASE: int = 10000    # PMT rawids start here
 
+# ── LEGEND-1000 cylinder ("detector") geometry ───────────────────────────────
+# Inner steel-sphere detectors (combined for the "inner" hit count).
+DETECTOR_INNER_IDS: tuple[int, ...] = (9000, 9001, 9002)
+# Outer SSD / Tyvek foil surfaces → area label. In the SSD run these carry the
+# my_tyvek_* surface; in the PMT+Tyvek run they carry the tyvek_* surface; the
+# det_uids are identical between the two runs.
+DETECTOR_OUTER_SURFACES: dict[int, str] = {
+    1965: "wall",   # zylinder foil
+    1966: "pit",    # pit foil
+    1967: "bot",    # bottom foil
+    1968: "top",    # top foil
+}
+DETECTOR_OUTER_IDS: tuple[int, ...] = tuple(DETECTOR_OUTER_SURFACES)
+# PMT det_uids are 8-digit integers beginning with '1' (e.g. 13031105). The base
+# is the smallest such value, used to separate PMT hits from surface hits.
+DETECTOR_PMT_UID_MIN: int = 10_000_000
+DETECTOR_N_PMTS_EXPECTED: int = 300
+
 # Reference Tyvek reflectivity table (wavelength in nm, reflectivity dimensionless)
 TYVEK_REF_TABLE: np.ndarray = np.array([
     [250, 0.80],
@@ -68,6 +94,35 @@ INNER_SPHERE_RADIUS_MM: float = 1000.0
 WALL_X_MM: float = 1950.0
 WALL_Y_MM: float = 1950.0
 WALL_Z_MM: float = 1.0
+
+
+# ════════════════════════ PMT uid ↔ voxel index (detector) ════════════════════
+
+def pmt_uid_to_voxel_index(uid: int) -> str:
+    """Map a detector-geometry PMT det_uid to its voxel ``index`` string.
+
+    PMT uids are 8-digit integers beginning with '1'. Stripping that leading '1'
+    leaves 7 digits:
+      * if those start with '0', the voxel index is the trailing 6 digits
+        (e.g. 10304046 → "304046", and 10001921 → "001921" — leading zeros kept);
+      * otherwise the voxel index is the full 7 digits
+        (e.g. 13040132 → "3040132").
+
+    Raises:
+        ValueError: if *uid* is not a well-formed 8-digit PMT uid.
+    """
+    s = str(int(uid))
+    if len(s) != 8 or s[0] != "1":
+        raise ValueError(
+            f"PMT uid {uid!r} is not an 8-digit value beginning with '1'."
+        )
+    rest = s[1:]                       # 7 digits
+    return rest[1:] if rest[0] == "0" else rest
+
+
+def pmt_uids_to_voxel_indices(uids: np.ndarray) -> list[str]:
+    """Vectorised wrapper around :func:`pmt_uid_to_voxel_index` for an array."""
+    return [pmt_uid_to_voxel_index(int(u)) for u in uids]
 
 
 # ══════════════════════════════ HDF5 Loading ══════════════════════════════════
@@ -155,17 +210,21 @@ def load_particles_wavelength(directory: Path) -> np.ndarray:
 def load_and_filter_hdf5_dir(
     directory: Path,
     geometry: str,
+    vertex_sample_cap: int = 200_000,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, dict]:
     """
     Load and validity-filter HDF5 files one at a time to minimise peak RAM.
 
     Each file's vertex arrays (~800 MB for 25 M vertices) are freed as soon as
-    the validity mask is computed.  Only the four columns needed downstream
-    (x, y, z, det_uid) are kept for valid hits.
+    the validity mask is computed.  Only the columns needed downstream
+    (x, y, z, det_uid, wavelength, time) are kept for valid hits, plus a small
+    random subsample of emission-vertex positions for the 3D vertex plot.
 
     Returns
     -------
-    data       : dict with keys x, y, z, det_uid — valid hits only
+    data       : dict with keys x, y, z, det_uid, wavelength, time — valid hits
+                 only — and ``vsample`` (an Nx3 array of subsampled emission
+                 vertices in mm, capped at *vertex_sample_cap*).
     valid_mask : all-True boolean array (hits are already filtered)
     stats      : aggregated validity stats across all files
     """
@@ -181,6 +240,14 @@ def load_and_filter_hdf5_dir(
         "invalid_momentum": 0, "no_vertex_match": 0,
         "outside_per_surface": {},
     }
+
+    # Subsample emission vertices across files for the 3D vertex scatter. We keep
+    # at most ``vertex_sample_cap`` points total (a fair per-file share) so the
+    # full ~25 M-row vertex arrays are never retained — preserving the peak-RAM
+    # streaming pattern.
+    per_file_cap = max(1, vertex_sample_cap // len(files))
+    rng = np.random.default_rng(0)
+    vsamples: list[np.ndarray] = []
 
     offset = np.int64(0)
     for f in files:
@@ -214,6 +281,16 @@ def load_and_filter_hdf5_dir(
             "wavelength": fdata["wavelength"][vmask],
             "time":       fdata["time"][vmask],
         })
+
+        # Subsample this file's emission vertices, then drop the full arrays.
+        n_v = len(fdata["vx"])
+        if n_v:
+            take = min(n_v, per_file_cap)
+            sel = (rng.choice(n_v, size=take, replace=False)
+                   if n_v > take else np.arange(n_v))
+            vsamples.append(np.column_stack([
+                fdata["vx"][sel], fdata["vy"][sel], fdata["vz"][sel],
+            ]))
         # fdata (vertices + full hit arrays) freed here
 
     n_valid = sum(len(p["x"]) for p in kept)
@@ -222,6 +299,9 @@ def load_and_filter_hdf5_dir(
     combined: dict[str, np.ndarray] = {
         k: np.concatenate([p[k] for p in kept]) for k in kept[0]
     }
+    combined["vsample"] = (
+        np.concatenate(vsamples) if vsamples else np.empty((0, 3))
+    )
     return combined, np.ones(len(combined["x"]), dtype=bool), stats
 
 
@@ -296,6 +376,16 @@ def apply_validity_filter(
     stats      : dict with counts
     """
     n = len(data["x"])
+
+    # The LEGEND-1000 cylinder geometry has no analytic active-volume cut defined,
+    # so no validity filtering is applied — every recorded hit is kept.
+    if geometry == "detector":
+        return np.ones(n, dtype=bool), {
+            "total": n, "valid": n, "invalid_vertex": 0,
+            "invalid_momentum": 0, "no_vertex_match": 0,
+            "outside_per_surface": {},
+        }
+
     valid = np.ones(n, dtype=bool)
 
     hit_pos = np.column_stack([data["x"], data["y"], data["z"]])
@@ -370,6 +460,33 @@ def apply_validity_filter(
         "outside_per_surface": outside_per_surface,
     }
     return valid, stats
+
+
+# ════════════════════════════ Surface-mask helpers ═══════════════════════════
+
+def outer_surface_mask(data: dict, geometry: str) -> np.ndarray:
+    """Boolean mask of hits on the outer SSD/Tyvek surface(s)."""
+    if geometry == "detector":
+        return np.isin(data["det_uid"], DETECTOR_OUTER_IDS)
+    return data["det_uid"] == TYVEK_DETECTOR_ID
+
+
+def pmt_cathode_mask(data: dict, geometry: str) -> np.ndarray:
+    """Boolean mask of hits on PMT cathodes."""
+    base = DETECTOR_PMT_UID_MIN if geometry == "detector" else PMT_DETECTOR_ID_BASE
+    return data["det_uid"] >= base
+
+
+def inner_detector_ids(geometry: str) -> tuple[int, ...]:
+    """The det_uids treated as the 'inner' detector for this geometry."""
+    if geometry == "detector":
+        return DETECTOR_INNER_IDS
+    return (INNER_SPHERE_DETECTOR_ID,)
+
+
+def has_inner_detector(geometry: str) -> bool:
+    """Whether this geometry defines a separate inner detector to compare."""
+    return geometry in ("sphere_in_sphere", "detector")
 
 
 # ═════════════════════════ GDML Reflectivity Parsing ══════════════════════════
@@ -493,6 +610,14 @@ def analyze_gdml_reflectivity(
     """Section 2.2 — Parse GDML and verify SSD reflectivity against formula."""
     print("\n── 2.2  GDML Reflectivity Verification ──────────────────────────────")
 
+    if geometry == "detector":
+        # The detector reflectivity is a per-area, externally-computed table that
+        # the scan rescales by an arbitrary factor; the area-weighted PMT-coverage
+        # formula used for the sphere/wall geometries does not apply here.
+        print("  Skipped for detector geometry (no area-weighted formula to verify "
+              "against; reflectivity is scaled directly by the scan factor).")
+        return
+
     matrices = parse_gdml_matrices(gdml_path)
 
     # Locate SSD (Tyvek-like) reflectivity
@@ -565,6 +690,33 @@ def analyze_gdml_reflectivity(
     print(f"\n  Saved: {out}")
 
 
+# ═══════════════════════════ PMT count check ═════════════════════════════════
+
+def check_pmt_count(pmt_data: dict) -> int:
+    """Detector geometry: count distinct PMT det_uids against the 300 expectation.
+
+    Raises:
+        RuntimeError: if MORE than DETECTOR_N_PMTS_EXPECTED PMT uids are present.
+    Warns (prints) if fewer. Returns the number of distinct PMT uids found.
+    """
+    print("\n── PMT count check ───────────────────────────────────────────────────")
+    pmt_uids = np.unique(
+        pmt_data["det_uid"][pmt_data["det_uid"] >= DETECTOR_PMT_UID_MIN]
+    )
+    n = len(pmt_uids)
+    if n > DETECTOR_N_PMTS_EXPECTED:
+        raise RuntimeError(
+            f"Found {n} distinct PMT uids in the PMT+Tyvek run, "
+            f"expected at most {DETECTOR_N_PMTS_EXPECTED}."
+        )
+    if n < DETECTOR_N_PMTS_EXPECTED:
+        print(f"  WARNING: found only {n} distinct PMT uids, "
+              f"expected {DETECTOR_N_PMTS_EXPECTED}.")
+    else:
+        print(f"  OK: {n} distinct PMT uids.")
+    return n
+
+
 # ═══════════════════════ Total Hit Comparison ════════════════════════════════
 
 def analyze_total_hits(
@@ -580,20 +732,20 @@ def analyze_total_hits(
     """Section 2.3 — Compare total hits SSD vs. PMT+Tyvek."""
     print("\n── 2.3  Total Hit Comparison ─────────────────────────────────────────")
 
-    # SSD: all hits on SSD surface
-    ssd_hits = ssd_valid & (ssd_data["det_uid"] == TYVEK_DETECTOR_ID)
+    # SSD: all hits on the outer SSD surface(s)
+    ssd_hits = ssd_valid & outer_surface_mask(ssd_data, geometry)
     n_ssd = int(ssd_hits.sum())
 
-    # PMT+Tyvek: all hits on Tyvek wall + PMT cathodes
+    # PMT+Tyvek: all hits on Tyvek wall/foils + PMT cathodes
     pmt_all_mask = pmt_valid & (
-        (pmt_data["det_uid"] == TYVEK_DETECTOR_ID) |
-        (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
+        outer_surface_mask(pmt_data, geometry)
+        | pmt_cathode_mask(pmt_data, geometry)
     )
     n_pmt_all = int(pmt_all_mask.sum())
 
     # PMT+Tyvek: PMT cathode hits only
-    pmt_cathode_mask = pmt_valid & (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
-    n_pmt_cathode = int(pmt_cathode_mask.sum())
+    pmt_cath_mask = pmt_valid & pmt_cathode_mask(pmt_data, geometry)
+    n_pmt_cathode = int(pmt_cath_mask.sum())
 
     eps_global = n_pmt_cathode / n_ssd if n_ssd > 0 else float("nan")
 
@@ -604,15 +756,18 @@ def analyze_total_hits(
 
     results = {"n_ssd": n_ssd, "n_pmt_all": n_pmt_all, "n_pmt_cathode": n_pmt_cathode, "eps_global": eps_global}
 
-    # Inner sphere check (sphere_in_sphere)
-    if geometry == "sphere_in_sphere":
-        inner_ssd = ssd_valid & (ssd_data["det_uid"] == INNER_SPHERE_DETECTOR_ID)
-        inner_pmt = pmt_valid & (pmt_data["det_uid"] == INNER_SPHERE_DETECTOR_ID)
+    # Inner detector check (sphere_in_sphere: one inner sphere; detector: the
+    # combined steel spheres 9000/9001/9002)
+    if has_inner_detector(geometry):
+        inner_ids = inner_detector_ids(geometry)
+        inner_ssd = ssd_valid & np.isin(ssd_data["det_uid"], inner_ids)
+        inner_pmt = pmt_valid & np.isin(pmt_data["det_uid"], inner_ids)
         n_inner_ssd = int(inner_ssd.sum())
         n_inner_pmt = int(inner_pmt.sum())
         ratio = n_inner_pmt / n_inner_ssd if n_inner_ssd > 0 else float("nan")
-        print(f"\n  Inner sphere hits (SSD):       {n_inner_ssd}")
-        print(f"  Inner sphere hits (PMT+Tyvek): {n_inner_pmt}")
+        ids_str = "+".join(str(i) for i in inner_ids)
+        print(f"\n  Inner hits (SSD)       [UID {ids_str}]: {n_inner_ssd}")
+        print(f"  Inner hits (PMT+Tyvek) [UID {ids_str}]: {n_inner_pmt}")
         print(f"  Ratio (should be ≈ 1):         {ratio:.4f}")
         results.update({
             "n_inner_ssd": n_inner_ssd,
@@ -620,12 +775,12 @@ def analyze_total_hits(
             "inner_sphere_ratio": ratio,
         })
 
-        # Inner sphere comparison plot
+        # Inner detector comparison plot
         fig, ax = plt.subplots(figsize=(6, 5))
         ax.bar(["SSD", "PMT+Tyvek"], [n_inner_ssd, n_inner_pmt],
                color=["steelblue", "orange"], alpha=0.8)
-        ax.set_ylabel("Inner sphere hits")
-        ax.set_title(f"Inner sphere hits (UID {INNER_SPHERE_DETECTOR_ID}): SSD vs. PMT+Tyvek\n(should be identical)")
+        ax.set_ylabel("Inner detector hits")
+        ax.set_title(f"Inner hits (UID {ids_str}): SSD vs. PMT+Tyvek\n(should be identical)")
         ax.text(0.5, 0.98, f"ratio = {ratio:.4f}",
                 ha="center", va="top", transform=ax.transAxes)
         ax.grid(axis="y", alpha=0.3)
@@ -636,8 +791,12 @@ def analyze_total_hits(
         print(f"  Saved: {out}")
 
     # Optionally include pmt_no_tyvek
+    if geometry == "detector":
+        ssd_label = "SSD\n(foils)"
+    else:
+        ssd_label = f"SSD\n(UID {TYVEK_DETECTOR_ID})"
     datasets = {
-        f"SSD\n(UID {TYVEK_DETECTOR_ID})": n_ssd,
+        ssd_label: n_ssd,
         "PMT+Tyvek\n(total)": n_pmt_all,
         "PMT cathode\nonly": n_pmt_cathode,
     }
@@ -737,7 +896,7 @@ def analyze_per_voxel_efficiency(
         return {}
 
     # ── Map SSD hits to voxels ─────────────────────────────────────────────
-    ssd_surface_mask = ssd_valid & (ssd_data["det_uid"] == TYVEK_DETECTOR_ID)
+    ssd_surface_mask = ssd_valid & outer_surface_mask(ssd_data, geometry)
     ssd_xyz = np.column_stack([ssd_data["x"], ssd_data["y"], ssd_data["z"]])
     ssd_hit_pos = ssd_xyz[ssd_surface_mask]
 
@@ -755,19 +914,36 @@ def analyze_per_voxel_efficiency(
             ssd_voxel_counts[idx] += 1
 
     # ── Map PMT hits by det_uid to selected voxels ─────────────────────────
-    pmt_cathode_mask = pmt_valid & (pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE)
-    pmt_uid = pmt_data["det_uid"][pmt_cathode_mask]
+    pmt_cath_mask = pmt_valid & pmt_cathode_mask(pmt_data, geometry)
+    pmt_uid = pmt_data["det_uid"][pmt_cath_mask]
     pmt_rawids = sorted(set(int(u) for u in pmt_uid))
     pmt_counts_by_rawid: dict[int, int] = {
         uid: int((pmt_uid == uid).sum()) for uid in pmt_rawids
     }
 
-    # Match PMT rawid = PMT_DETECTOR_ID_BASE + i to selected_voxels[i]
     n_pmt_vox = len(selected_voxels)
     pmt_counts: np.ndarray = np.zeros(n_pmt_vox, dtype=int)
-    for i, sv in enumerate(selected_voxels):
-        expected_rawid = PMT_DETECTOR_ID_BASE + int(sv["index"])
-        pmt_counts[i] = pmt_counts_by_rawid.get(expected_rawid, 0)
+
+    if geometry == "detector":
+        # PMT det_uid encodes its voxel index (see pmt_uid_to_voxel_index). Build
+        # a per-index hit count, then assign to each selected voxel by index.
+        selected_index_set = {sv["index"] for sv in selected_voxels}
+        pmt_counts_by_index: dict[str, int] = {}
+        for uid, cnt in pmt_counts_by_rawid.items():
+            vidx = pmt_uid_to_voxel_index(uid)
+            if vidx not in selected_index_set:
+                raise ValueError(
+                    f"PMT uid {uid} maps to voxel index {vidx!r}, which is not "
+                    f"among the {n_pmt_vox} selected voxels."
+                )
+            pmt_counts_by_index[vidx] = pmt_counts_by_index.get(vidx, 0) + cnt
+        for i, sv in enumerate(selected_voxels):
+            pmt_counts[i] = pmt_counts_by_index.get(sv["index"], 0)
+    else:
+        # Match PMT rawid = PMT_DETECTOR_ID_BASE + i to selected_voxels[i]
+        for i, sv in enumerate(selected_voxels):
+            expected_rawid = PMT_DETECTOR_ID_BASE + int(sv["index"])
+            pmt_counts[i] = pmt_counts_by_rawid.get(expected_rawid, 0)
 
     # SSD counts at PMT voxel positions
     # Find list-index of each selected voxel in all_voxels
@@ -802,7 +978,9 @@ def analyze_per_voxel_efficiency(
 
     ax = axes[0]
     bar_w = 0.4
-    ax.bar(x_pos - bar_w / 2, ssd_at_pmt, bar_w, label=f"SSD, UID {TYVEK_DETECTOR_ID} (at PMT voxel)", color="steelblue", alpha=0.8)
+    ssd_bar_label = ("SSD foils (at PMT voxel)" if geometry == "detector"
+                     else f"SSD, UID {TYVEK_DETECTOR_ID} (at PMT voxel)")
+    ax.bar(x_pos - bar_w / 2, ssd_at_pmt, bar_w, label=ssd_bar_label, color="steelblue", alpha=0.8)
     ax.bar(x_pos + bar_w / 2, pmt_counts,   bar_w, label="PMT cathode",                               color="orange",   alpha=0.8)
     # Average hit counts over the PMT voxels (unweighted means) — shows whether
     # the SSD surface and the PMT cathodes record the same number of hits.
@@ -980,8 +1158,8 @@ def plot_3d_voxels(
     fig = plt.figure(figsize=(13, 11))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Transparent reference surface
-    if geometry != "wall":
+    # Transparent reference surface (sphere geometries only)
+    if geometry in ("sphere", "sphere_in_sphere"):
         r = SPHERE_INNER_RADIUS_MM
         u = np.linspace(0, 2 * np.pi, 40)
         v = np.linspace(0, np.pi, 40)
@@ -992,11 +1170,13 @@ def plot_3d_voxels(
             alpha=0.05, color="lightblue", edgecolor="none",
         )
 
+    all_voxels_label = ("All voxels" if geometry == "detector"
+                        else f"All voxels, UID {TYVEK_DETECTOR_ID}")
     other = all_centers[~sel_mask]
     if len(other):
         ax.scatter(other[:, 0], other[:, 1], other[:, 2],
                    c="cornflowerblue", s=20, alpha=0.55,
-                   label=f"All voxels, UID {TYVEK_DETECTOR_ID} ({(~sel_mask).sum()})")
+                   label=f"{all_voxels_label} ({(~sel_mask).sum()})")
 
     sel = all_centers[sel_mask]
     if len(sel):
@@ -1023,6 +1203,48 @@ def plot_3d_voxels(
     print(f"  Saved: {out}")
 
 
+# ═══════════════════════════ 3D Vertex Position Plot ═════════════════════════
+
+def plot_3d_vertices(
+    datasets: list[tuple[str, dict]],
+    geometry: str,
+    output_dir: Path,
+    max_points: int = 50_000,
+) -> None:
+    """3D scatter of emission-vertex positions for every simulation dataset.
+
+    Uses the subsampled vertex cloud collected by ``load_and_filter_hdf5_dir``
+    (key ``vsample``). One PNG per dataset.
+    """
+    print("\n── 3D Vertex Positions ───────────────────────────────────────────────")
+
+    rng = np.random.default_rng(0)
+    for label, data in datasets:
+        v = data.get("vsample")
+        if v is None or len(v) == 0:
+            print(f"  {label}: no vertex sample available; skipping.")
+            continue
+        if len(v) > max_points:
+            v = v[rng.choice(len(v), max_points, replace=False)]
+
+        safe = label.lower().replace("+", "").replace(" ", "_")
+        fig = plt.figure(figsize=(11, 9))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.scatter(v[:, 0], v[:, 1], v[:, 2], s=2, alpha=0.25,
+                   c="steelblue", edgecolors="none")
+        ax.set_xlabel("X [mm]")
+        ax.set_ylabel("Y [mm]")
+        ax.set_zlabel("Z [mm]")
+        ax.set_title(f"Emission-vertex positions — {label} ({geometry})\n"
+                     f"{len(v):,} of {len(data['vsample']):,} sampled points")
+        ax.set_box_aspect([1, 1, 1])
+        plt.tight_layout()
+        out = output_dir / f"vertices_3d_{safe}.png"
+        plt.savefig(out, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out}")
+
+
 # ═══════════════════════════ Wavelength Histograms ═══════════════════════════
 
 def plot_wavelength_histograms(
@@ -1043,11 +1265,10 @@ def plot_wavelength_histograms(
     print(f"    {len(emit_wl)} emitted photons in 200–800 nm range")
 
     # ── Detected photons ─────────────────────────────────────────────────────
-    ssd_surface = ssd_data["det_uid"] == TYVEK_DETECTOR_ID
-    ssd_wl = ssd_data["wavelength"][ssd_surface]
-
-    pmt_cathode = pmt_data["det_uid"] >= PMT_DETECTOR_ID_BASE
-    pmt_wl = pmt_data["wavelength"][pmt_cathode]
+    ssd_wl = ssd_data["wavelength"][outer_surface_mask(ssd_data, geometry)]
+    pmt_wl = pmt_data["wavelength"][pmt_cathode_mask(pmt_data, geometry)]
+    ssd_wl_label = ("SSD foils" if geometry == "detector"
+                    else f"SSD surface, UID {TYVEK_DETECTOR_ID}")
 
     print(f"    SSD surface detected:   {len(ssd_wl)}")
     print(f"    PMT cathode detected:   {len(pmt_wl)}")
@@ -1064,7 +1285,7 @@ def plot_wavelength_histograms(
 
     # Right: detected spectra (SSD + PMT cathode overlaid)
     ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7,
-             label=f"SSD surface, UID {TYVEK_DETECTOR_ID} ({len(ssd_wl):,})")
+             label=f"{ssd_wl_label} ({len(ssd_wl):,})")
     ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7,
              label=f"PMT cathode ({len(pmt_wl):,})")
     ax2.set_xlabel("Wavelength (nm)")
@@ -1089,8 +1310,15 @@ def plot_time_distributions(
     pmt_data: dict,
     geometry: str,
     output_dir: Path,
+    all_voxels: Optional[list[dict]] = None,
 ) -> None:
-    """Hit-time histograms for outer and (if sphere_in_sphere) inner sphere."""
+    """Hit-time histograms for the outer surface(s) and inner detector.
+
+    For the detector geometry, one plot is produced per outer foil surface
+    (wall/pit/bot/top) plus one combined plot over all outer surfaces; the PMT
+    side is split into Tyvek-foil and PMT-cathode contributions, with cathode
+    hits assigned to their area via the voxel ``layer`` field.
+    """
     print("\n── Time Distributions ────────────────────────────────────────────────")
 
     def _fit_exp_decay(
@@ -1258,6 +1486,13 @@ def plot_time_distributions(
         plt.close(fig)
         print(f"  Saved: {filename}")
 
+    if geometry == "detector":
+        _detector_time_distributions(
+            ssd_data, pmt_data, all_voxels or [], output_dir,
+            _hist_pair_split, _hist_pair,
+        )
+        return
+
     # ── Outer sphere ──────────────────────────────────────────────────────────
     # SSD simulation: hits on SSD/Tyvek surface (UID 1000)
     ssd_outer_t = ssd_data["time"][ssd_data["det_uid"] == TYVEK_DETECTOR_ID]
@@ -1303,6 +1538,85 @@ def plot_time_distributions(
         )
 
 
+def _detector_time_distributions(
+    ssd_data: dict,
+    pmt_data: dict,
+    all_voxels: list[dict],
+    output_dir: Path,
+    hist_pair_split,
+    hist_pair,
+) -> None:
+    """Per-surface + combined hit-time distributions for the detector geometry.
+
+    For each outer foil surface (wall/pit/bot/top) the SSD-run hits on that
+    surface are compared to the PMT-run Tyvek-foil hits plus the PMT-cathode
+    hits assigned to that area. A combined plot sums over all outer surfaces.
+    A separate plot covers the combined inner steel spheres.
+    """
+    # ── Assign each PMT-cathode hit to its area via voxel index → layer ────────
+    layer_by_index: dict[str, Optional[str]] = {
+        v["index"]: v.get("layer") for v in all_voxels
+    }
+    cath = pmt_cathode_mask(pmt_data, "detector")
+    cath_uid = pmt_data["det_uid"][cath]
+    cath_time = pmt_data["time"][cath]
+
+    if len(cath_uid):
+        uniq, inv = np.unique(cath_uid, return_inverse=True)
+        uniq_layer = np.empty(len(uniq), dtype=object)
+        for i, u in enumerate(uniq):
+            vidx = pmt_uid_to_voxel_index(int(u))
+            if vidx not in layer_by_index:
+                raise ValueError(
+                    f"PMT uid {int(u)} maps to voxel index {vidx!r}, which is not "
+                    f"present in the voxel JSON — cannot assign it to an area."
+                )
+            uniq_layer[i] = layer_by_index[vidx]
+        cath_layer = uniq_layer[inv]
+    else:
+        cath_layer = np.empty(0, dtype=object)
+
+    # ── Per-surface plots ──────────────────────────────────────────────────────
+    for uid, label in DETECTOR_OUTER_SURFACES.items():
+        ssd_t = ssd_data["time"][ssd_data["det_uid"] == uid]
+        pmt_foil_t = pmt_data["time"][pmt_data["det_uid"] == uid]
+        pmt_cath_t = cath_time[cath_layer == label]
+        print(f"  Surface '{label}' (UID {uid}): "
+              f"SSD {len(ssd_t):,}, Tyvek {len(pmt_foil_t):,}, "
+              f"PMT cathode {len(pmt_cath_t):,}")
+        hist_pair_split(
+            ssd_t, pmt_foil_t, pmt_cath_t,
+            title_ssd=f"SSD — {label} foil (UID {uid})",
+            title_pmt=f"PMT+Tyvek — {label}: Tyvek foil (UID {uid}) + PMT cathode",
+            suptitle=f"{label.capitalize()} surface hit time distribution — detector",
+            filename=output_dir / f"time_distribution_{label}.png",
+        )
+
+    # ── Combined over all outer surfaces ───────────────────────────────────────
+    ssd_outer_t = ssd_data["time"][outer_surface_mask(ssd_data, "detector")]
+    pmt_foil_all_t = pmt_data["time"][outer_surface_mask(pmt_data, "detector")]
+    hist_pair_split(
+        ssd_outer_t, pmt_foil_all_t, cath_time,
+        title_ssd="SSD — all outer foils",
+        title_pmt="PMT+Tyvek — all Tyvek foils + all PMT cathodes",
+        suptitle="Combined outer surface hit time distribution — detector",
+        filename=output_dir / "time_distribution_outer.png",
+    )
+
+    # ── Combined inner steel spheres ───────────────────────────────────────────
+    inner_ids = inner_detector_ids("detector")
+    ssd_inner_t = ssd_data["time"][np.isin(ssd_data["det_uid"], inner_ids)]
+    pmt_inner_t = pmt_data["time"][np.isin(pmt_data["det_uid"], inner_ids)]
+    ids_str = "+".join(str(i) for i in inner_ids)
+    hist_pair(
+        ssd_inner_t, pmt_inner_t,
+        title_ssd=f"SSD — inner spheres (UID {ids_str})",
+        title_pmt=f"PMT+Tyvek — inner spheres (UID {ids_str})",
+        suptitle="Inner sphere hit time distribution — detector",
+        filename=output_dir / "time_distribution_inner.png",
+    )
+
+
 # ═══════════════════════════════════ Main ════════════════════════════════════
 
 def main() -> None:
@@ -1320,7 +1634,8 @@ def main() -> None:
     parser.add_argument("--voxel-json",    type=Path, required=True,
                         help="Path to all-voxels JSON (generated by createGeometry.py --variant ssd)")
     parser.add_argument("--geometry",
-                        choices=["wall", "sphere", "sphere_in_sphere"], required=True,
+                        choices=["wall", "sphere", "sphere_in_sphere", "detector"],
+                        required=True,
                         help="Detector geometry type")
     parser.add_argument("--output-dir",    type=Path, required=True,
                         help="Directory for output plots and results JSON")
@@ -1395,12 +1710,22 @@ def main() -> None:
             args.data_pmt_no_tyvek, args.geometry
         )
 
+    # Detector geometry: enforce the 300-PMT expectation before analysis.
+    if args.geometry == "detector":
+        check_pmt_count(pmt_data)
+
     plot_validity_report(
         ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
     )
     plot_outside_in_hits(
         ssd_stats, pmt_stats, args.geometry, args.output_dir, pmt_notyvek_stats
     )
+
+    # 3D emission-vertex scatter (all scenarios).
+    vertex_datasets = [("SSD", ssd_data), ("PMT+Tyvek", pmt_data)]
+    if pmt_notyvek_data is not None:
+        vertex_datasets.append(("PMT only", pmt_notyvek_data))
+    plot_3d_vertices(vertex_datasets, args.geometry, args.output_dir)
 
     # ── 2.2 GDML reflectivity verification ─────────────────────────────────
     analyze_gdml_reflectivity(args.gdml, args.geometry, n_pmts, args.output_dir)
@@ -1430,7 +1755,7 @@ def main() -> None:
 
     # ── Time distributions ───────────────────────────────────────────────────
     plot_time_distributions(
-        ssd_data, pmt_data, args.geometry, args.output_dir
+        ssd_data, pmt_data, args.geometry, args.output_dir, all_voxels
     )
 
     # ── Save summary JSON ───────────────────────────────────────────────────

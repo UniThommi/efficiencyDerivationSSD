@@ -2,11 +2,19 @@
 """Scale the SSD/Tyvek optical-property matrices inside a GDML file.
 
 This standalone utility reads a GDML geometry produced by the geometry-generation
-workflow and writes a *modified copy* in which the property values of two specific
-optical-property matrices are multiplied by user-supplied factors:
+workflow and writes a *modified copy* in which the property values of specific
+optical-property matrices are multiplied by user-supplied factors. The matrix set
+is chosen by ``--geometry``:
 
-    my_tyvek_foil_surface_REFLECTIVITY   <- scaled by --reflectivity-factor
-    my_tyvek_foil_surface_EFFICIENCY     <- scaled by --efficiency-factor
+    sphere   (default):
+        my_tyvek_foil_surface_REFLECTIVITY            <- scaled by --reflectivity-factor
+        my_tyvek_foil_surface_EFFICIENCY              <- scaled by --efficiency-factor
+
+    detector (LEGEND-1000 cylinder; bot/top foils reuse the zylinder surface):
+        my_tyvek_zylinder_foil_surface_REFLECTIVITY   <- scaled by --reflectivity-factor
+        my_tyvek_pit_foil_surface_REFLECTIVITY        <- scaled by --reflectivity-factor
+        my_tyvek_zylinder_foil_surface_EFFICIENCY     <- scaled by --efficiency-factor
+        my_tyvek_pit_foil_surface_EFFICIENCY          <- scaled by --efficiency-factor
 
 Each matrix stores alternating ``energy value`` pairs, e.g.::
 
@@ -36,11 +44,28 @@ import re
 import sys
 from pathlib import Path
 
-# Exact ``name`` attribute values of the two matrices to scale. Matching is exact
-# (not substring) because some geometries also define a standard ``tyvek_*`` set of
-# matrices that must NOT be touched.
-REFLECTIVITY_MATRIX_NAME = "my_tyvek_foil_surface_REFLECTIVITY"
-EFFICIENCY_MATRIX_NAME = "my_tyvek_foil_surface_EFFICIENCY"
+# Exact ``name`` attribute values of the matrices to scale, keyed by ``--geometry``.
+# Matching is exact (not substring) because some geometries also define a standard
+# ``tyvek_*`` set of matrices that must NOT be touched.
+#
+#   sphere   — the single-surface SSD sphere/wall geometry (one matrix each).
+#   detector — the LEGEND-1000 cylinder geometry. The bot/top foils reuse the
+#              zylinder surface material, so only the zylinder and pit foil
+#              surfaces carry their own REFLECTIVITY/EFFICIENCY matrices.
+REFLECTIVITY_MATRIX_NAMES: dict[str, list[str]] = {
+    "sphere": ["my_tyvek_foil_surface_REFLECTIVITY"],
+    "detector": [
+        "my_tyvek_zylinder_foil_surface_REFLECTIVITY",
+        "my_tyvek_pit_foil_surface_REFLECTIVITY",
+    ],
+}
+EFFICIENCY_MATRIX_NAMES: dict[str, list[str]] = {
+    "sphere": ["my_tyvek_foil_surface_EFFICIENCY"],
+    "detector": [
+        "my_tyvek_zylinder_foil_surface_EFFICIENCY",
+        "my_tyvek_pit_foil_surface_EFFICIENCY",
+    ],
+}
 
 # A self-closing ``<matrix .../>`` element. GDML matrix tags never contain a literal
 # '>' inside their attributes, so a non-greedy ``[^>]*`` is a safe, fast tokenizer.
@@ -90,6 +115,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help="Existing directory where the modified GDML file is written.",
+    )
+    parser.add_argument(
+        "-g",
+        "--geometry",
+        choices=sorted(REFLECTIVITY_MATRIX_NAMES),
+        default="sphere",
+        help=(
+            "Which set of matrices to scale. 'sphere' (default) scales the single "
+            "my_tyvek_foil_surface_* matrices; 'detector' scales the LEGEND-1000 "
+            "zylinder and pit foil REFLECTIVITY/EFFICIENCY matrices (bot/top reuse "
+            "the zylinder surface)."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -253,16 +290,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    reflectivity_names = REFLECTIVITY_MATRIX_NAMES[args.geometry]
+    efficiency_names = EFFICIENCY_MATRIX_NAMES[args.geometry]
+
     # --- Read, scale, write ---------------------------------------------------
     text = input_path.read_text(encoding="utf-8")
 
+    n_reflectivity = 0
+    n_efficiency = 0
     try:
-        text, n_reflectivity = scale_matrix_in_text(
-            text, REFLECTIVITY_MATRIX_NAME, reflectivity_factor
-        )
-        text, n_efficiency = scale_matrix_in_text(
-            text, EFFICIENCY_MATRIX_NAME, efficiency_factor
-        )
+        for name in reflectivity_names:
+            text, n = scale_matrix_in_text(text, name, reflectivity_factor)
+            n_reflectivity += n
+        for name in efficiency_names:
+            text, n = scale_matrix_in_text(text, name, efficiency_factor)
+            n_efficiency += n
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -278,8 +320,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Summary --------------------------------------------------------------
     print("Tyvek property scaling complete.")
+    print(f"  Geometry                    : {args.geometry}")
     print(f"  Input file                  : {input_path}")
     print(f"  Output file                 : {output_path}")
+    print(f"  Reflectivity matrices       : {', '.join(reflectivity_names)}")
+    print(f"  Efficiency matrices         : {', '.join(efficiency_names)}")
     print(f"  Reflectivity factor         : {reflectivity_factor}")
     print(f"  Efficiency factor           : {efficiency_factor}")
     print(f"  Modified reflectivity values: {n_reflectivity}")
