@@ -1486,9 +1486,73 @@ def plot_time_distributions(
         plt.close(fig)
         print(f"  Saved: {filename}")
 
+    def _hist_quad(
+        row_top: tuple,
+        row_bot: tuple,
+        suptitle: str,
+        filename: Path,
+    ) -> None:
+        """Two stacked SSD|PMT hist pairs (top and bottom rows), each fitted.
+
+        Each row is ``(t_ssd, t_pmt, title_ssd, title_pmt)``. Bins are shared
+        within a row (computed from that row's own data) but independent
+        between rows, so the top and bottom panels can span different time
+        ranges. Both the SSD and PMT histograms in every row are fitted with
+        the exponential-decay model.
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), squeeze=False)
+        for r, (t_ssd, t_pmt, title_ssd, title_pmt) in enumerate((row_top, row_bot)):
+            t_min = min(
+                t_ssd.min() if len(t_ssd) else 0.0,
+                t_pmt.min() if len(t_pmt) else 0.0,
+            )
+            t_max = max(
+                t_ssd.max() if len(t_ssd) else 1.0,
+                t_pmt.max() if len(t_pmt) else 1.0,
+            )
+            bins = np.linspace(t_min, t_max, 101)
+
+            ax1, ax2 = axes[r]
+            ax1.hist(t_ssd, bins=bins, color="steelblue", alpha=0.8)
+            ax1.set_xlabel("Time (ns)")
+            ax1.set_ylabel("Hit count")
+            ax1.set_title(f"{title_ssd}\n{len(t_ssd):,} hits")
+            ax1.grid(True, alpha=0.3)
+
+            ax2.hist(t_pmt, bins=bins, color="orange", alpha=0.8)
+            ax2.set_xlabel("Time (ns)")
+            ax2.set_ylabel("Hit count")
+            ax2.set_title(f"{title_pmt}\n{len(t_pmt):,} hits")
+            ax2.grid(True, alpha=0.3)
+
+            ssd_fit = _fit_exp_decay(t_ssd, bins, "SSD")
+            if ssd_fit is not None:
+                A, t0, tau, t_curve, y_curve = ssd_fit
+                ax1.plot(
+                    t_curve, y_curve, color="darkblue", lw=2.0,
+                    label=f"SSD fit: A = {A:.0f}, t₀ = {t0:.1f} ns, τ = {tau:.1f} ns",
+                )
+                ax1.legend(fontsize=9)
+
+            pmt_fit = _fit_exp_decay(t_pmt, bins, "PMTs+T")
+            if pmt_fit is not None:
+                A, t0, tau, t_curve, y_curve = pmt_fit
+                ax2.plot(
+                    t_curve, y_curve, color="darkred", lw=2.0,
+                    label=f"PMTs+T fit: A = {A:.0f}, t₀ = {t0:.1f} ns, τ = {tau:.1f} ns",
+                )
+                ax2.legend(fontsize=9)
+
+        fig.suptitle(suptitle, fontsize=13)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=200)
+        plt.close(fig)
+        print(f"  Saved: {filename}")
+
     if geometry == "detector":
         _detector_time_distributions(
-            ssd_data, pmt_data, all_voxels or [], output_dir, _hist_pair,
+            ssd_data, pmt_data, all_voxels or [], output_dir,
+            _hist_pair, _hist_quad,
         )
         return
 
@@ -1543,6 +1607,7 @@ def _detector_time_distributions(
     all_voxels: list[dict],
     output_dir: Path,
     hist_pair,
+    hist_quad,
 ) -> None:
     """Per-surface + combined hit-time distributions for the detector geometry.
 
@@ -1550,7 +1615,8 @@ def _detector_time_distributions(
     surface are compared to the PMT-run Tyvek-foil hits *merged with* the
     PMT-cathode hits assigned to that area, drawn as a single combined
     distribution and fitted as one. A combined plot sums over all outer
-    surfaces. A separate plot covers the combined inner steel spheres.
+    surfaces, and a two-row plot contrasts the non-pit outer surfaces with the
+    pit surface. A separate plot covers the combined inner steel spheres.
     """
     # ── Assign each PMT-cathode hit to its area via voxel index → layer ────────
     layer_by_index: dict[str, Optional[str]] = {
@@ -1616,6 +1682,36 @@ def _detector_time_distributions(
         suptitle="Combined outer surface hit time distribution — detector",
         filename=output_dir / "time_distribution_outer.png",
         fit=True,
+    )
+
+    # ── Non-pit outer surfaces (top row) vs. pit surface (bottom row) ──────────
+    # Top: all outer foils except pit; bottom: pit only — same content as
+    # time_distribution_pit.png. PMT side merges Tyvek-foil + PMT-cathode hits.
+    pit_uid = next(u for u, l in DETECTOR_OUTER_SURFACES.items() if l == "pit")
+    nonpit_uids = tuple(u for u in DETECTOR_OUTER_SURFACES if u != pit_uid)
+
+    ssd_nonpit_t = ssd_data["time"][np.isin(ssd_data["det_uid"], nonpit_uids)]
+    pmt_foil_nonpit_t = pmt_data["time"][np.isin(pmt_data["det_uid"], nonpit_uids)]
+    pmt_cath_nonpit_t = cath_time[cath_layer != "pit"]
+    pmt_nonpit_t = np.concatenate([pmt_foil_nonpit_t, pmt_cath_nonpit_t])
+    n_pmts_nonpit = len(uniq_layer) - pmts_per_area.get("pit", 0)
+
+    ssd_pit_t = ssd_data["time"][ssd_data["det_uid"] == pit_uid]
+    pmt_foil_pit_t = pmt_data["time"][pmt_data["det_uid"] == pit_uid]
+    pmt_cath_pit_t = cath_time[cath_layer == "pit"]
+    pmt_pit_t = np.concatenate([pmt_foil_pit_t, pmt_cath_pit_t])
+    n_pmts_pit = pmts_per_area.get("pit", 0)
+
+    nonpit_labels = "+".join(DETECTOR_OUTER_SURFACES[u] for u in nonpit_uids)
+    hist_quad(
+        (ssd_nonpit_t, pmt_nonpit_t,
+         f"SSD — outer foils except pit ({nonpit_labels})",
+         f"PMT+Tyvek — except pit: Tyvek foils + PMT cathode (combined, {n_pmts_nonpit} PMTs)"),
+        (ssd_pit_t, pmt_pit_t,
+         f"SSD — pit foil (UID {pit_uid})",
+         f"PMT+Tyvek — pit: Tyvek foil (UID {pit_uid}) + PMT cathode (combined, {n_pmts_pit} PMTs)"),
+        suptitle="Outer surface hit time distribution: non-pit vs. pit — detector",
+        filename=output_dir / "time_distribution_outer_nonpit_pit.png",
     )
 
     # ── Combined inner steel spheres ───────────────────────────────────────────
