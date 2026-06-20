@@ -1488,8 +1488,7 @@ def plot_time_distributions(
 
     if geometry == "detector":
         _detector_time_distributions(
-            ssd_data, pmt_data, all_voxels or [], output_dir,
-            _hist_pair_split, _hist_pair,
+            ssd_data, pmt_data, all_voxels or [], output_dir, _hist_pair,
         )
         return
 
@@ -1543,15 +1542,15 @@ def _detector_time_distributions(
     pmt_data: dict,
     all_voxels: list[dict],
     output_dir: Path,
-    hist_pair_split,
     hist_pair,
 ) -> None:
     """Per-surface + combined hit-time distributions for the detector geometry.
 
     For each outer foil surface (wall/pit/bot/top) the SSD-run hits on that
-    surface are compared to the PMT-run Tyvek-foil hits plus the PMT-cathode
-    hits assigned to that area. A combined plot sums over all outer surfaces.
-    A separate plot covers the combined inner steel spheres.
+    surface are compared to the PMT-run Tyvek-foil hits *merged with* the
+    PMT-cathode hits assigned to that area, drawn as a single combined
+    distribution and fitted as one. A combined plot sums over all outer
+    surfaces. A separate plot covers the combined inner steel spheres.
     """
     # ── Assign each PMT-cathode hit to its area via voxel index → layer ────────
     layer_by_index: dict[str, Optional[str]] = {
@@ -1574,33 +1573,49 @@ def _detector_time_distributions(
             uniq_layer[i] = layer_by_index[vidx]
         cath_layer = uniq_layer[inv]
     else:
+        uniq_layer = np.empty(0, dtype=object)
         cath_layer = np.empty(0, dtype=object)
 
+    # Number of distinct PMTs assigned to each area (one count per unique uid).
+    pmts_per_area: dict[Optional[str], int] = {}
+    for lyr in uniq_layer:
+        pmts_per_area[lyr] = pmts_per_area.get(lyr, 0) + 1
+
     # ── Per-surface plots ──────────────────────────────────────────────────────
+    # The PMT run's Tyvek-foil and PMT-cathode hits for an area are merged into a
+    # single combined distribution and fitted as one (concatenated time array).
     for uid, label in DETECTOR_OUTER_SURFACES.items():
         ssd_t = ssd_data["time"][ssd_data["det_uid"] == uid]
         pmt_foil_t = pmt_data["time"][pmt_data["det_uid"] == uid]
         pmt_cath_t = cath_time[cath_layer == label]
+        pmt_combined_t = np.concatenate([pmt_foil_t, pmt_cath_t])
+        n_pmts_area = pmts_per_area.get(label, 0)
         print(f"  Surface '{label}' (UID {uid}): "
               f"SSD {len(ssd_t):,}, Tyvek {len(pmt_foil_t):,}, "
-              f"PMT cathode {len(pmt_cath_t):,}")
-        hist_pair_split(
-            ssd_t, pmt_foil_t, pmt_cath_t,
+              f"PMT cathode {len(pmt_cath_t):,}, "
+              f"PMT+Tyvek combined {len(pmt_combined_t):,}, "
+              f"{n_pmts_area} PMTs")
+        hist_pair(
+            ssd_t, pmt_combined_t,
             title_ssd=f"SSD — {label} foil (UID {uid})",
-            title_pmt=f"PMT+Tyvek — {label}: Tyvek foil (UID {uid}) + PMT cathode",
-            suptitle=f"{label.capitalize()} surface hit time distribution — detector",
+            title_pmt=f"PMT+Tyvek — {label}: Tyvek foil (UID {uid}) + PMT cathode (combined)",
+            suptitle=f"{label.capitalize()} surface hit time distribution — detector "
+                     f"({n_pmts_area} PMTs)",
             filename=output_dir / f"time_distribution_{label}.png",
+            fit=True,
         )
 
     # ── Combined over all outer surfaces ───────────────────────────────────────
     ssd_outer_t = ssd_data["time"][outer_surface_mask(ssd_data, "detector")]
     pmt_foil_all_t = pmt_data["time"][outer_surface_mask(pmt_data, "detector")]
-    hist_pair_split(
-        ssd_outer_t, pmt_foil_all_t, cath_time,
+    pmt_combined_all_t = np.concatenate([pmt_foil_all_t, cath_time])
+    hist_pair(
+        ssd_outer_t, pmt_combined_all_t,
         title_ssd="SSD — all outer foils",
-        title_pmt="PMT+Tyvek — all Tyvek foils + all PMT cathodes",
+        title_pmt="PMT+Tyvek — all Tyvek foils + all PMT cathodes (combined)",
         suptitle="Combined outer surface hit time distribution — detector",
         filename=output_dir / "time_distribution_outer.png",
+        fit=True,
     )
 
     # ── Combined inner steel spheres ───────────────────────────────────────────
