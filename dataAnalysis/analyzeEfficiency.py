@@ -1028,6 +1028,95 @@ def analyze_per_voxel_efficiency(
     }
 
 
+# ═══════════════════════ Per-Area Efficiency (detector) ═══════════════════════
+
+def analyze_per_area_efficiency(
+    ssd_data: dict,
+    ssd_valid: np.ndarray,
+    pmt_data: dict,
+    pmt_valid: np.ndarray,
+    all_voxels: list[dict],
+    output_dir: Path,
+) -> dict:
+    """Per-foil-area ratio ε_area = N_PMT_cathode / N_SSD (detector geometry).
+
+    For each outer foil surface (wall/pit/bot/top) the PMT-run cathode hits whose
+    voxel ``layer`` matches that area are counted and divided by the SSD-run hits
+    on that area's foil surface. A combined value over all four surfaces is also
+    reported. Writes a bar plot (ratio annotated on each bar) and returns the
+    counts/ratios for summary.json.
+    """
+    print("\n── Per-Area Cathode/SSD Ratio ────────────────────────────────────────")
+
+    # ── Assign each PMT-cathode hit to its area via voxel index → layer ────────
+    layer_by_index: dict[str, Optional[str]] = {
+        v["index"]: v.get("layer") for v in all_voxels
+    }
+    cath = pmt_valid & pmt_cathode_mask(pmt_data, "detector")
+    cath_uid = pmt_data["det_uid"][cath]
+
+    if len(cath_uid):
+        uniq, inv = np.unique(cath_uid, return_inverse=True)
+        uniq_layer = np.empty(len(uniq), dtype=object)
+        for i, u in enumerate(uniq):
+            vidx = pmt_uid_to_voxel_index(int(u))
+            if vidx not in layer_by_index:
+                raise ValueError(
+                    f"PMT uid {int(u)} maps to voxel index {vidx!r}, which is not "
+                    f"present in the voxel JSON — cannot assign it to an area."
+                )
+            uniq_layer[i] = layer_by_index[vidx]
+        cath_layer = uniq_layer[inv]
+    else:
+        cath_layer = np.empty(0, dtype=object)
+
+    # ── Per-area counts and ratios ─────────────────────────────────────────────
+    labels = list(DETECTOR_OUTER_SURFACES.values())   # wall, pit, bot, top
+    per_area: dict[str, dict] = {}
+    for uid, label in DETECTOR_OUTER_SURFACES.items():
+        n_ssd = int((ssd_valid & (ssd_data["det_uid"] == uid)).sum())
+        n_cath = int((cath_layer == label).sum())
+        ratio = n_cath / n_ssd if n_ssd > 0 else float("nan")
+        per_area[label] = {"n_ssd": n_ssd, "n_cathode": n_cath, "ratio": ratio}
+        print(f"  {label:<5} (UID {uid}):  N_cathode = {n_cath:>10,}   "
+              f"N_SSD = {n_ssd:>10,}   ε = {ratio:.6f}")
+
+    n_ssd_all = sum(a["n_ssd"] for a in per_area.values())
+    n_cath_all = sum(a["n_cathode"] for a in per_area.values())
+    ratio_all = n_cath_all / n_ssd_all if n_ssd_all > 0 else float("nan")
+    per_area["combined"] = {
+        "n_ssd": n_ssd_all, "n_cathode": n_cath_all, "ratio": ratio_all,
+    }
+    print(f"  {'all':<5}        :  N_cathode = {n_cath_all:>10,}   "
+          f"N_SSD = {n_ssd_all:>10,}   ε = {ratio_all:.6f}")
+
+    # ── Bar plot ───────────────────────────────────────────────────────────────
+    plot_labels = labels + ["combined"]
+    ratios = [per_area[l]["ratio"] for l in plot_labels]
+    x_pos = np.arange(len(plot_labels))
+    colors = ["steelblue"] * len(labels) + ["firebrick"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x_pos, ratios, color=colors, alpha=0.85)
+    ymax = max((r for r in ratios if np.isfinite(r)), default=1.0)
+    for xi, r in zip(x_pos, ratios):
+        if np.isfinite(r):
+            ax.text(xi, r + ymax * 0.01, f"{r:.4f}",
+                    ha="center", va="bottom", fontsize=10)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels([l.capitalize() for l in plot_labels])
+    ax.set_ylabel(r"$\epsilon_{area} = N_{cathode}\,/\,N_{SSD}$")
+    ax.set_title("Per-area PMT-cathode / SSD hit ratio — detector")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    out = output_dir / "per_area_cathode_ssd_ratio.png"
+    plt.savefig(out, dpi=200)
+    plt.close(fig)
+    print(f"  Saved: {out}")
+
+    return per_area
+
+
 # ═══════════════════════════ Validity Report Plot ════════════════════════════
 
 def plot_validity_report(
@@ -1856,6 +1945,13 @@ def main() -> None:
             all_voxels, selected_voxels, args.geometry, args.output_dir,
         )
 
+    # ── Per-area cathode/SSD ratio (detector geometry only) ──────────────────
+    per_area_results: dict = {}
+    if args.geometry == "detector":
+        per_area_results = analyze_per_area_efficiency(
+            ssd_data, ssd_valid, pmt_data, pmt_valid, all_voxels, args.output_dir,
+        )
+
     # ── 2.5 3D voxel plot ───────────────────────────────────────────────────
     plot_3d_voxels(all_voxels, selected_voxels, args.geometry, args.output_dir)
 
@@ -1879,6 +1975,7 @@ def main() -> None:
         },
         "total_hits": total_results,
         "per_voxel": voxel_results,
+        "per_area": per_area_results,
     }
     if pmt_notyvek_stats:
         summary["validity_filter"]["pmt_notyvek"] = pmt_notyvek_stats
