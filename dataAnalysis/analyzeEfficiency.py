@@ -188,23 +188,43 @@ def load_hdf5_dir(directory: Path) -> dict[str, np.ndarray]:
     return combined
 
 
-def load_particles_wavelength(directory: Path) -> np.ndarray:
+def load_particles_wavelength(directory: Path) -> tuple[np.ndarray, bool]:
     """
     Load emitted-photon wavelengths (nm) from the particles table.
 
     Reads ekin_in_MeV from //hit/particles for every HDF5 file in *directory*,
     converts to wavelength via λ = hc/E, and returns only entries that fall
     in the 100–1500 nm range (i.e. genuine optical photons).
+
+    The ``//hit/particles`` group is *optional*: detector-mode neutron-capture
+    optical-light files are written without it. Files lacking the group (or its
+    ``ekin_in_MeV`` dataset) are skipped rather than raising.
+
+    Returns
+    -------
+    wavelengths : 1-D array of emitted-photon wavelengths in nm (empty if no
+                  file carried a particles table).
+    available   : True iff at least one file provided a particles table.
     """
     files = sorted(directory.glob("*.hdf5")) + sorted(directory.glob("*.h5"))
     parts: list[np.ndarray] = []
+    n_missing = 0
     for f in files:
         with h5py.File(f, "r") as hf:
-            ekin_mev = np.asarray(hf["hit"]["particles"]["ekin_in_MeV"]["pages"],
+            hit = hf["hit"]
+            if "particles" not in hit or "ekin_in_MeV" not in hit["particles"]:
+                n_missing += 1
+                continue
+            ekin_mev = np.asarray(hit["particles"]["ekin_in_MeV"]["pages"],
                                   dtype=np.float64)
         wl = HC_EV_NM / (ekin_mev * 1e6)
         parts.append(wl)
-    return np.concatenate(parts) if parts else np.array([], dtype=float)
+
+    if n_missing:
+        print(f"    {n_missing}/{len(files)} file(s) have no //hit/particles table.")
+    available = bool(parts)
+    wavelengths = np.concatenate(parts) if parts else np.array([], dtype=float)
+    return wavelengths, available
 
 
 def load_and_filter_hdf5_dir(
@@ -1342,16 +1362,29 @@ def plot_wavelength_histograms(
     ssd_dir: Path,
     geometry: str,
     output_dir: Path,
-) -> None:
-    """Side-by-side histograms: emitted photon spectrum vs detected spectrum."""
+) -> bool:
+    """Histograms of the emitted vs. detected photon spectra.
+
+    The emitted spectrum is reconstructed from the optional ``//hit/particles``
+    table. When that table is absent (e.g. detector-mode neutron-capture
+    optical-light files), only the detected spectrum is drawn and a prominent
+    warning is printed. Returns whether emitted (particle-truth) data was
+    available.
+    """
     print("\n── Wavelength Histograms ─────────────────────────────────────────────")
 
     bins = np.linspace(200, 800, 121)
 
     # ── Emitted photons (from particles table, SSD dataset) ──────────────────
     print("  Loading emitted-photon wavelengths from particles table …")
-    emit_wl = load_particles_wavelength(ssd_dir)
-    print(f"    {len(emit_wl)} emitted photons in 200–800 nm range")
+    emit_wl, particles_available = load_particles_wavelength(ssd_dir)
+    if particles_available:
+        print(f"    {len(emit_wl)} emitted photons in 200–800 nm range")
+    else:
+        print("\n  " + "!" * 71)
+        print("  WARNING: Particle dataset not found. Plotting the detected photon")
+        print("  spectrum only; the emitted (particle-truth) spectrum is unavailable.")
+        print("  " + "!" * 71)
 
     # ── Detected photons ─────────────────────────────────────────────────────
     ssd_wl = ssd_data["wavelength"][outer_surface_mask(ssd_data, geometry)]
@@ -1362,27 +1395,37 @@ def plot_wavelength_histograms(
     print(f"    SSD surface detected:   {len(ssd_wl)}")
     print(f"    PMT cathode detected:   {len(pmt_wl)}")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    def _draw_detected(ax) -> None:
+        ax.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7,
+                label=f"{ssd_wl_label} ({len(ssd_wl):,})")
+        ax.hist(pmt_wl, bins=bins, color="orange", alpha=0.7,
+                label=f"PMT cathode ({len(pmt_wl):,})")
+        ax.set_xlabel("Wavelength (nm)")
+        ax.set_ylabel("Counts")
+        ax.set_title("Detected photon spectrum")
+        ax.set_xlim(200, 800)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
 
-    # Left: emitted spectrum
-    ax1.hist(emit_wl, bins=bins, color="steelblue", alpha=0.8)
-    ax1.set_xlabel("Wavelength (nm)")
-    ax1.set_ylabel("Counts")
-    ax1.set_title("Emitted photon spectrum\n(vertex photons, SSD simulation)")
-    ax1.set_xlim(200, 800)
-    ax1.grid(True, alpha=0.3)
-
-    # Right: detected spectra (SSD + PMT cathode overlaid)
-    ax2.hist(ssd_wl, bins=bins, color="steelblue", alpha=0.7,
-             label=f"{ssd_wl_label} ({len(ssd_wl):,})")
-    ax2.hist(pmt_wl, bins=bins, color="orange", alpha=0.7,
-             label=f"PMT cathode ({len(pmt_wl):,})")
-    ax2.set_xlabel("Wavelength (nm)")
-    ax2.set_ylabel("Counts")
-    ax2.set_title("Detected photon spectrum")
-    ax2.set_xlim(200, 800)
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3)
+    if particles_available:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        # Left: emitted spectrum
+        ax1.hist(emit_wl, bins=bins, color="steelblue", alpha=0.8)
+        ax1.set_xlabel("Wavelength (nm)")
+        ax1.set_ylabel("Counts")
+        ax1.set_title("Emitted photon spectrum\n(vertex photons, SSD simulation)")
+        ax1.set_xlim(200, 800)
+        ax1.grid(True, alpha=0.3)
+        # Right: detected spectra (SSD + PMT cathode overlaid)
+        _draw_detected(ax2)
+    else:
+        # No particle truth → single-panel detected-only spectrum.
+        fig, ax = plt.subplots(figsize=(8, 5))
+        _draw_detected(ax)
+        ax.text(0.98, 0.97,
+                "emitted spectrum unavailable\n(no //hit/particles table)",
+                ha="right", va="top", transform=ax.transAxes, fontsize=8,
+                color="dimgray")
 
     fig.suptitle(f"Photon wavelength spectra — {geometry}", fontsize=13)
     plt.tight_layout()
@@ -1390,6 +1433,7 @@ def plot_wavelength_histograms(
     plt.savefig(out, dpi=200)
     plt.close(fig)
     print(f"  Saved: {out}")
+    return particles_available
 
 
 # ═══════════════════════════ Time Distributions ══════════════════════════════
@@ -1956,9 +2000,16 @@ def main() -> None:
     plot_3d_voxels(all_voxels, selected_voxels, args.geometry, args.output_dir)
 
     # ── Wavelength histograms ────────────────────────────────────────────────
-    plot_wavelength_histograms(
+    particles_available = plot_wavelength_histograms(
         ssd_data, pmt_data, args.data_ssd, args.geometry, args.output_dir
     )
+    if not particles_available:
+        print("\n" + "=" * 71)
+        print("  WARNING: Particle dataset not found. Running detector-mode efficiency")
+        print("  analysis without particle-level information. Features depending on")
+        print("  particle truth data have been disabled (only the emitted-photon")
+        print("  spectrum panel is affected; all efficiency results are unaffected).")
+        print("=" * 71)
 
     # ── Time distributions ───────────────────────────────────────────────────
     plot_time_distributions(
@@ -1969,6 +2020,7 @@ def main() -> None:
     summary = {
         "geometry": args.geometry,
         "n_pmts": n_pmts,
+        "particle_data_available": particles_available,
         "validity_filter": {
             "ssd": ssd_stats,
             "pmt": pmt_stats,
