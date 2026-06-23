@@ -797,10 +797,17 @@ def analyze_total_hits(
 
         # Inner detector comparison plot
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.bar(["SSD", "PMT+Tyvek"], [n_inner_ssd, n_inner_pmt],
+        inner_counts = [n_inner_ssd, n_inner_pmt]
+        ax.bar(["SSD", "PMT+Tyvek"], inner_counts,
                color=["steelblue", "orange"], alpha=0.8)
         ax.set_ylabel("Inner detector hits")
         ax.set_title(f"Inner hits (UID {ids_str}): SSD vs. PMT+Tyvek\n(should be identical)")
+        # Annotate each bar with its exact hit count.
+        ymax = max(inner_counts) if max(inner_counts) > 0 else 1
+        for i, n in enumerate(inner_counts):
+            ax.text(i, n + ymax * 0.01, f"{n:,}", ha="center", va="bottom",
+                    fontsize=10)
+        ax.set_ylim(top=ymax * 1.08)
         ax.text(0.5, 0.98, f"ratio = {ratio:.4f}",
                 ha="center", va="top", transform=ax.transAxes)
         ax.grid(axis="y", alpha=0.3)
