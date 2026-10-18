@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
 """
-Unified GDML geometry creation for SSD efficiency validation.
+Build the GDML test geometries for validating the sensitive surface detector (SSD).
 
-Geometries: wall | sphere | sphere_in_sphere
-Variants:
-  calc_reflectivity - Print area-weighted SSD reflectivity table to stdout (no GDML written).
-                      Run this BEFORE creating the SSD geometry to obtain the correct
-                      my_tyvek reflectivity values; then update legendoptics/my_tyvek manually.
-  ssd           - SSD surface (area-weighted reflectivity); generates voxel JSON
-  pmt           - Tyvek + PMTs; reads voxel JSON, selects N homogeneous PMTs
-  pmt_no_tyvek  - PMTs only, no Tyvek wall (wall geometry only)
+In the LEGEND-1000 simulations the PMTs and the reflective Tyvek foil of the water
+tank are replaced by one continuous SSD surface whose reflectivity is the
+area-weighted mixture of PMT cathode and Tyvek. This script builds simplified
+geometries of increasing complexity in which this superposition can be compared
+with a discrete PMT layout on Tyvek:
+
+  wall              flat 1950 mm x 1950 mm plate
+  sphere            closed spherical shell (inner radius 1739.52 mm)
+  sphere_in_sphere  the sphere plus an inner steel sphere (radius 1000 mm) that is
+                    registered as an additional optical detector
+
+Each geometry is built in matched variants:
+
+  calc_reflectivity  print the area-weighted SSD reflectivity table (no GDML written).
+                     Run this BEFORE building the ssd variant and copy the values into
+                     legendoptics/my_tyvek by hand.
+  ssd                SSD surface (my_tyvek) + voxel grid (writes the voxel JSON)
+  pmt                Tyvek surface + N PMTs at homogeneously selected voxels
+                     (reads the voxel JSON, writes <voxels>_selected.json)
+  pmt_no_tyvek       the same PMTs without the Tyvek plate (wall geometry only)
+
+Every GDML-writing variant also writes a remage detector macro (macro<Stem>.mac) and
+voxel plots. The geometries are simulated with remage outside this repository;
+dataAnalysis/analyzeEfficiency.py compares the SSD and PMT simulations.
+
+Requires pyg4ometry, pygeomtools and l1000geom (legend-pygeom-l1000). ./src is
+appended to sys.path, so l1000geom is also found when the script is started from the
+legend-pygeom-l1000 root.
 
 Usage examples:
   # 0. Calculate SSD reflectivity table for a sphere with 50 PMTs (update legendoptics first!)
@@ -53,7 +73,14 @@ from l1000geom import materials
 from pygeomtools import RemageDetectorInfo, detectors, geometry, visualization
 
 # ══════════════════════════════════ Constants ══════════════════════════════════
+# The geometry constants are duplicated in dataAnalysis/analyzeEfficiency.py and
+# must be changed in both files.
 
+# PMT front, same model as in legend-pygeom-l1000 (Hamamatsu R7081-20-100): window,
+# vacuum and cathode are ellipsoid caps above their lower z-cuts. The cathode cap
+# (semi-axes 128/128/129 mm) has a radius of 128·sqrt(1 − (65/129)²) ≈ 110.6 mm at
+# its cut, rounded to PMT_CATHODE_RADIUS. The projected cathode area π·(110 mm)² is
+# the "PMT area" used for voxel sizing and for the SSD coverage fraction.
 PMT_EFF_RADIUS: float = 131.0         # mm — PMT ellipsoid semi-axis
 PMT_CATHODE_RADIUS: float = 110.0     # mm — effective cathode radius at z-cut
 PMT_VACUUM_RADIUS: float = 128.0      # mm — vacuum inner radius (glass ~2-3 mm)
@@ -61,22 +88,27 @@ PMT_Z_BOTTOM_CUT: float = 41.0       # mm — lower z-cut of window ellipsoid
 PMT_CATHODE_Z_CUT: float = 65.0      # mm — lower z-cut of cathode ellipsoid
 PMT_Z_TOP_CUT: float = 200.0          # mm — upper z-cut
 
-SPHERE_INNER_RADIUS: float = 1739.52  # mm
+# 4π·R² = 1000 × (195 mm)²: the sphere holds 1000 voxels, each with the area of one
+# 195 mm × 195 mm wall voxel (≈ one cathode area, π·(110 mm)² ≈ 38 013 mm²).
+SPHERE_INNER_RADIUS: float = 1739.52  # mm — inner radius of the Tyvek/SSD shell
 SPHERE_THICKNESS: float = 1.0         # mm
 INNER_SPHERE_RADIUS: float = 1000.0   # mm — steel sphere (sphere_in_sphere only)
 SPHERE_N_LAT: int = 25                # latitude bands  → 25 × 40 = 1000 voxels
 SPHERE_N_LON: int = 40                # longitude cells per band (fixed)
 
-WALL_X: float = 1950.0                # mm
-WALL_Y: float = 1950.0                # mm
+WALL_X: float = 1950.0                # mm — 10 × 195 mm
+WALL_Y: float = 1950.0                # mm — 10 × 195 mm
 WALL_Z: float = 1.0                   # mm — wall thickness
 
-PMT_DETECTOR_ID_BASE: int = 10000     # rawid = PMT_DETECTOR_ID_BASE + i
+# remage optical detector IDs (rawid / det_uid in the simulation output)
+PMT_DETECTOR_ID_BASE: int = 10000     # PMT rawid = PMT_DETECTOR_ID_BASE + int(voxel["index"])
 TYVEK_DETECTOR_ID: int = 1000         # rawid for Tyvek / SSD surface
 INNER_SPHERE_DETECTOR_ID: int = 9000  # rawid for inner steel sphere
 
 PMT_CATHODE_REFLECTIVITY: float = 0.028725181851905604  # wavelength-independent
 
+# Reference Tyvek reflectivity (wavelength in nm, reflectivity). analyzeEfficiency.py
+# holds the same table and checks it against the Tyvek matrix in the GDML.
 TYVEK_REFLECTIVITY_TABLE: list[tuple[float, float]] = [
     (250, 0.80),
     (300, 0.90),
@@ -95,7 +127,17 @@ def construct_pmt_front(
     surfaces,
     reg: geant4.Registry,
 ) -> list:
-    """Construct shared PMT solid geometry (window, vacuum, cathode)."""
+    """
+    Build the PMT parts shared by all PMTs: window, vacuum and cathode.
+
+    The three ellipsoid caps are nested window ⊃ vacuum ⊃ cathode. Only the
+    cathode gets its logical volume here, with the photocathode skin surface
+    attached; window and vacuum logical volumes are created per PMT in
+    ``place_pmt_front``.
+
+    Returns:
+        [window solid, vacuum solid, cathode logical volume]
+    """
     pmt_window = geant4.solid.Ellipsoid(
         "PMT_window",
         PMT_EFF_RADIUS, PMT_EFF_RADIUS, PMT_EFF_RADIUS,
@@ -122,9 +164,11 @@ def construct_pmt_front(
 
 def get_euler_angles(target_direction: np.ndarray) -> list:
     """
-    Compute XYZ Euler angles (radians) that rotate [0,0,1] → target_direction.
+    XYZ Euler angles (radians) that orient a placed volume's local +z axis along
+    ``target_direction``.
 
-    Uses cross(from, to) rotation axis convention, consistent across all geometries.
+    The angles are extrinsic "xyz" angles as used for GDML ``physvol`` rotations.
+    The parallel case returns no rotation, the anti-parallel case 180° about x.
     """
     default = np.array([0.0, 0.0, 1.0])
     target = np.asarray(target_direction, dtype=float)
@@ -138,7 +182,10 @@ def get_euler_angles(target_direction: np.ndarray) -> list:
     if abs(angle - np.pi) < 1e-6:
         return [float(np.pi), 0.0, 0.0]  # 180° around x-axis
 
-    axis = np.cross(target, default)  # correct: cross(from, to)
+    # cross(to, from): the angles describe the rotation target → +z. GDML/Geant4
+    # apply a physvol rotation as the inverse (frame) rotation, so the placed
+    # volume's local +z axis ends up along target_direction.
+    axis = np.cross(target, default)
     axis /= np.linalg.norm(axis)
 
     with warnings.catch_warnings():
@@ -158,7 +205,17 @@ def place_pmt_front(
     surface_registry,
     rawid: int,
 ) -> geant4.PhysicalVolume:
-    """Instantiate unique PMT logical volumes and place into mother volume."""
+    """
+    Place one PMT (window ⊃ vacuum ⊃ cathode) into ``mother_lv``.
+
+    New window and vacuum logical volumes are created for every PMT so that each
+    cathode is a unique physical volume and can be registered as its own remage
+    optical detector with ``rawid``. ``rotation`` and ``translation`` place the
+    window in the mother volume. ``surface_registry`` is accepted but not used.
+
+    Returns:
+        The physical volume of the PMT window.
+    """
     window_lv = geant4.LogicalVolume(
         pmt_volumes[0], mat_registry.borosilicate, name + "_window", reg
     )
@@ -218,7 +275,13 @@ def generate_sphere_voxels(
     1000 voxels): equal-area latitude bands (uniform in cos θ) each split into
     the same n_lon longitude cells, so every voxel has identical area
     4πR²/(n_lat·n_lon).  The 25 × 40 factorisation hits the PMT-equivalence
-    target (≈1000) exactly.
+    target (≈1000) exactly. Cells near the poles are narrow wedges: equal in area,
+    not in shape. ``pmt_radius`` only enters the printed target count.
+
+    Each voxel has ``index`` (6-digit running number), ``center`` (mm),
+    ``layer`` = "sphere" and its grid position (``grid_ilat``, ``grid_ilon``,
+    ``n_lat``, ``n_lon``). The list order is ``i_lat * n_lon + i_lon``, which the
+    sphere plots rely on.
     """
     pmt_area = np.pi * pmt_radius**2
     sphere_area = 4.0 * np.pi * radius**2
@@ -261,8 +324,13 @@ def generate_wall_voxels(
     """
     Generate a uniform rectangular grid of voxels on the wall surface.
 
-    Each voxel's area approximates one PMT cathode area (pi * pmt_radius^2).
-    Voxels are centered in the xy-plane at z = 0 (wall center in GDML coordinates).
+    The voxel count is the wall area divided by one PMT cathode area
+    (pi * pmt_radius^2), split into n_x × n_y cells according to the wall's
+    aspect ratio; the default 1950 mm × 1950 mm wall gives 10 × 10 voxels of
+    195 mm × 195 mm. Voxels are centered in the xy-plane at z = 0 (wall center in
+    GDML coordinates). The ``index`` is ``f"{ix:02d}{iy:02d}"``; ``grid_ix``,
+    ``grid_iy``, ``n_x`` and ``n_y`` are stored for the hit-to-voxel lookup in
+    analyzeEfficiency.py.
     """
     pmt_area = np.pi * pmt_radius**2
     n_total = wall_x * wall_y / pmt_area
@@ -304,8 +372,13 @@ def select_sphere_pmts(voxels: list[dict], n_select: int) -> list[int]:
     """
     Select n_select voxels as homogeneously as possible on a sphere.
 
-    Uses Fibonacci spiral to generate n_select ideal positions, then assigns
-    each to the nearest voxel center via KD-tree.
+    Uses a Fibonacci (golden-angle) spiral, running from pole to pole along the
+    y axis, to generate n_select ideal positions, then assigns each to the nearest
+    voxel center via KD-tree. Points that snap to the same voxel are merged, so
+    fewer than n_select voxels can be returned (the caller prints a warning).
+
+    Returns:
+        Sorted list positions of the selected voxels in ``voxels``.
     """
     if n_select >= len(voxels):
         return list(range(len(voxels)))
@@ -336,7 +409,11 @@ def select_wall_pmts(voxels: list[dict], n_select: int) -> list[int]:
     Select n_select voxels as homogeneously as possible on a flat wall.
 
     Uses a 2D Fibonacci lattice to generate ideal positions, then assigns
-    each to the nearest voxel center via KD-tree.
+    each to the nearest voxel center via KD-tree. As on the sphere, duplicates
+    are merged.
+
+    Returns:
+        Sorted list positions of the selected voxels in ``voxels``.
     """
     if n_select >= len(voxels):
         return list(range(len(voxels)))
@@ -353,7 +430,8 @@ def select_wall_pmts(voxels: list[dict], n_select: int) -> list[int]:
 
     phi = (1.0 + np.sqrt(5.0)) / 2.0  # golden ratio
     k = np.arange(n_select)
-    # Van der Corput sequence in base 2 and golden ratio
+    # Golden-ratio lattice: x_k = frac(k·φ), y_k = k/N, scaled to the range of
+    # the voxel centers
     fib_x = x_min + (x_max - x_min) * ((k * phi) % 1.0)
     fib_y = y_min + (y_max - y_min) * (k / n_select)
     fib_pts = np.column_stack([fib_x, fib_y])
@@ -363,8 +441,9 @@ def select_wall_pmts(voxels: list[dict], n_select: int) -> list[int]:
     return sorted(set(int(i) for i in indices))
 
 
-# Fixed wall PMT layout: 5 hand-picked voxels (overrides Fibonacci selection
-# when --fixed-voxels is given). Each becomes PMT<index> via the usual naming.
+# Fixed wall PMT layout: 5 hand-picked voxels, grid cells (2,2), (2,8), (5,5), (8,2)
+# and (8,8) of the 10 × 10 grid (overrides Fibonacci selection when --fixed-voxels
+# is given). Each becomes PMT<index> via the usual naming.
 FIXED_WALL_VOXEL_INDICES: list[str] = ["0202", "0208", "0505", "0802", "0808"]
 
 
@@ -389,6 +468,8 @@ def compute_homogeneity(selected_centers: np.ndarray) -> dict:
     Compute nearest-neighbour distance statistics as a homogeneity metric.
 
     Lower coefficient of variation (std/mean) = more homogeneous distribution.
+    Takes 3D centers (sphere) or 2D x/y centers (wall). The result is only
+    printed; it does not influence the selection.
     """
     if len(selected_centers) < 2:
         return {"n": len(selected_centers), "mean_nn_mm": 0.0, "std_nn_mm": 0.0, "cv": 0.0}
@@ -479,6 +560,7 @@ def _infer_sphere_grid(all_voxels: list[dict]) -> tuple[int, int]:
 
 
 def _sphere_point(theta: float, phi: float, radius: float) -> tuple:
+    """Cartesian point (x, y, z) on the sphere for polar angle theta and azimuth phi."""
     return (
         radius * np.sin(theta) * np.cos(phi),
         radius * np.sin(theta) * np.sin(phi),
@@ -654,6 +736,12 @@ def calc_ssd_reflectivity(geometry: str, n_pmts: int) -> None:
 
     R_SSD(λ) = S * R_cathode + (1 - S) * R_Tyvek(λ)
     where S = A_PMT / A_total  (inner sphere excluded from A_total).
+
+    A_PMT = n_pmts · π · PMT_CATHODE_RADIUS², A_total is the area of the outer
+    surface (sphere: 4πR², wall: WALL_X · WALL_Y), and R_Tyvek is evaluated at the
+    wavelengths of TYVEK_REFLECTIVITY_TABLE. The printed table has to be copied
+    into legendoptics/my_tyvek by hand before the ssd variant is built;
+    analyzeEfficiency.py later checks the GDML against the same formula.
     """
     if geometry in ("sphere", "sphere_in_sphere"):
         a_total = 4.0 * np.pi * SPHERE_INNER_RADIUS**2
@@ -686,6 +774,7 @@ def _build_world(
     world_is_vacuum: bool,
     size_m: float = 20.0,
 ) -> geant4.LogicalVolume:
+    """World box with edge length size_m, filled with water (default) or vacuum."""
     world_mat = mat_registry.vacuum if world_is_vacuum else mat_registry.water
     world_solid = geant4.solid.Box("world", size_m, size_m, size_m, reg, "m")
     world_lv = geant4.LogicalVolume(world_solid, world_mat, "world", reg)
@@ -694,12 +783,14 @@ def _build_world(
 
 
 def _macro_filename(gdml_path: str) -> str:
+    """remage macro path next to the GDML, e.g. sphere_ssd.gdml → macroSphere_ssd.mac."""
     p = Path(gdml_path)
     stem = p.stem
     return str(p.parent / ("macro" + stem[0].upper() + stem[1:] + ".mac"))
 
 
 def _write_gdml(reg: geant4.Registry, out_filename: str) -> None:
+    """Write the GDML and the remage macro that registers its optical detectors."""
     detectors.write_detector_auxvals(reg)
     visualization.write_color_auxvals(reg)
     geometry.check_registry_sanity(reg, reg)
@@ -715,6 +806,7 @@ def _write_gdml(reg: geant4.Registry, out_filename: str) -> None:
 # ══════════════════════════ Sphere Geometry ═══════════════════════════════════
 
 def _build_tyvek_sphere_solid(reg: geant4.Registry) -> geant4.solid.Sphere:
+    """Spherical shell from SPHERE_INNER_RADIUS to SPHERE_INNER_RADIUS + SPHERE_THICKNESS."""
     return geant4.solid.Sphere(
         "tyvek_sphere",
         SPHERE_INNER_RADIUS, SPHERE_INNER_RADIUS + SPHERE_THICKNESS,
@@ -732,7 +824,18 @@ def build_sphere_geometry(
     world_is_vacuum: bool,
     with_inner_sphere: bool = False,
 ) -> None:
-    """Build sphere (or sphere_in_sphere) geometry in the requested variant."""
+    """
+    Build sphere (or sphere_in_sphere) geometry in the requested variant.
+
+    The shell is the SSD surface (``my_tyvek``) in the ssd variant and standard
+    Tyvek (``tyvek``) in the pmt variant; in both it is optical detector
+    TYVEK_DETECTOR_ID. With ``with_inner_sphere``, a solid steel sphere with a
+    Tyvek skin surface is added as detector INNER_SPHERE_DETECTOR_ID, identical in
+    both variants. The ssd variant generates and saves the voxel grid; the pmt
+    variant loads it, selects ``n_pmts`` voxels, saves them to
+    ``<voxels>_selected.json`` and places one PMT per selected voxel. Writes the
+    GDML, the remage macro and three voxel plots.
+    """
     reg = geant4.Registry()
     mat_registry = materials.OpticalMaterialRegistry(reg)
     surface_registry = materials.surfaces.OpticalSurfaceRegistry(reg)
@@ -852,7 +955,14 @@ def build_wall_geometry(
     world_is_vacuum: bool,
     fixed_voxels: bool = False,
 ) -> None:
-    """Build wall geometry in the requested variant (ssd / pmt / pmt_no_tyvek)."""
+    """
+    Build wall geometry in the requested variant (ssd / pmt / pmt_no_tyvek).
+
+    ssd: SSD plate (``my_tyvek``) + voxel grid; pmt: Tyvek plate + PMTs;
+    pmt_no_tyvek: the same PMTs without a plate, as a bare-PMT reference. The
+    plate is optical detector TYVEK_DETECTOR_ID. PMT positions come from the 2D
+    Fibonacci lattice or, with ``fixed_voxels``, from FIXED_WALL_VOXEL_INDICES.
+    """
     reg = geant4.Registry()
     mat_registry = materials.OpticalMaterialRegistry(reg)
     surface_registry = materials.surfaces.OpticalSurfaceRegistry(reg)
@@ -1016,7 +1126,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--n-pmts", type=int, default=None,
-        help="Number of PMTs to place (pmt/pmt_no_tyvek variants only, default: 50)",
+        help=(
+            "Number of PMTs: PMTs to place (pmt/pmt_no_tyvek) or PMTs in the "
+            "coverage fraction S (calc_reflectivity). Default: 50"
+        ),
     )
     parser.add_argument(
         "--fixed-voxels", action="store_true",

@@ -10,3 +10,11 @@ Thumbs.db
 *.sh
 *.json
 *.png
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
+# The README is tracked despite the *.md rule above
+!README.md
+!docs/*.png

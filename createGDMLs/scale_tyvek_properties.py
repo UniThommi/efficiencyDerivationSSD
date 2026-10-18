@@ -3,8 +3,11 @@
 
 This standalone utility reads a GDML geometry produced by the geometry-generation
 workflow and writes a *modified copy* in which the property values of specific
-optical-property matrices are multiplied by user-supplied factors. The matrix set
-is chosen by ``--geometry``:
+optical-property matrices are multiplied by user-supplied factors. It is used to
+adapt the SSD reflectivity (and detection efficiency) without rebuilding the
+geometry: the scaled copies are simulated and compared with the PMT+Tyvek
+simulation by ``dataAnalysis/analyzeEfficiency.py``. The matrix set is chosen by
+``--geometry``:
 
     sphere   (default):
         my_tyvek_foil_surface_REFLECTIVITY            <- scaled by --reflectivity-factor
@@ -92,8 +95,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Define and parse the command-line interface."""
     parser = argparse.ArgumentParser(
         description=(
-            "Create a copy of a GDML file with the my_tyvek_foil_surface "
-            "REFLECTIVITY and EFFICIENCY property values scaled by the given factors."
+            "Create a copy of a GDML file with the REFLECTIVITY and EFFICIENCY "
+            "property values of the SSD (my_tyvek_*) foil surfaces scaled by the "
+            "given factors."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
